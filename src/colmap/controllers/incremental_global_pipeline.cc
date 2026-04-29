@@ -11,6 +11,7 @@
 #include "colmap/scene/database_cache.h"
 #include "colmap/scene/reconstruction.h"
 #include "colmap/sfm/global_mapper.h"
+#include "colmap/util/file.h"
 #include "colmap/util/logging.h"
 #include "colmap/util/misc.h"
 #include "colmap/util/timer.h"
@@ -22,6 +23,18 @@ namespace {
 // Warns when too few cameras have prior focal lengths (copied from
 // global_pipeline.cc).
 constexpr double kMinPriorFocalLengthRatio = 0.5;
+
+// Returns true only when all three required files are present in the directory
+// (binary or text).  A partial write (e.g. cameras.bin exists but points3D.bin
+// does not yet) returns false so the caller can fall back safely.
+bool IsReconstructionComplete(const std::filesystem::path& path) {
+  return (ExistsFile(path / "cameras.bin") &&
+          ExistsFile(path / "images.bin") &&
+          ExistsFile(path / "points3D.bin")) ||
+         (ExistsFile(path / "cameras.txt") &&
+          ExistsFile(path / "images.txt") &&
+          ExistsFile(path / "points3D.txt"));
+}
 
 bool HasInsufficientPriorFocalLengths(const DatabaseCache& database_cache) {
   const auto& cameras = database_cache.Cameras();
@@ -105,6 +118,42 @@ void IncrementalGlobalPipeline::Run() {
   // ── Incremental-add path ───────────────────────────────────────────────
 
   // 1. Load the prior reconstruction.
+  //    Guard against partial writes: if the directory exists but doesn't yet
+  //    contain all three required files (e.g. a previous run is still writing
+  //    or crashed mid-write), fall back to a standard global reconstruction
+  //    rather than crashing with a fatal throw inside Reconstruction::Read().
+  if (!IsReconstructionComplete(options_.prior_reconstruction_path)) {
+    LOG(WARNING)
+        << "IncrementalGlobalPipeline: prior reconstruction at "
+        << options_.prior_reconstruction_path
+        << " is incomplete or still being written. "
+           "Falling back to standard global reconstruction.";
+    auto reconstruction = std::make_shared<Reconstruction>();
+    GlobalMapperOptions mapper_opts = options_.mapper;
+    mapper_opts.image_path = options_.image_path;
+    mapper_opts.num_threads = options_.num_threads;
+    mapper_opts.random_seed = options_.random_seed;
+
+    GlobalMapper mapper(database_cache_);
+    mapper.BeginReconstruction(reconstruction);
+
+    Timer t;
+    t.Start();
+    mapper.Solve(mapper_opts);
+    LOG(INFO) << "Reconstruction done in " << t.ElapsedSeconds() << " s";
+
+    AlignReconstructionToOrigRigScales(database_cache_->Rigs(),
+                                       reconstruction.get());
+
+    Reconstruction& out =
+        *reconstruction_manager_->Get(reconstruction_manager_->Add());
+    out = *reconstruction;
+    if (!options_.image_path.empty()) {
+      out.ExtractColorsForAllImages(options_.image_path);
+    }
+    return;
+  }
+
   LOG(INFO) << "IncrementalGlobalPipeline: loading prior reconstruction from "
             << options_.prior_reconstruction_path;
   Reconstruction prior_reconstruction;

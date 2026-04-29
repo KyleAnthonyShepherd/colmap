@@ -120,37 +120,15 @@ void IncrementalGlobalPipeline::Run() {
   // 1. Load the prior reconstruction.
   //    Guard against partial writes: if the directory exists but doesn't yet
   //    contain all three required files (e.g. a previous run is still writing
-  //    or crashed mid-write), fall back to a standard global reconstruction
-  //    rather than crashing with a fatal throw inside Reconstruction::Read().
+  //    or crashed mid-write), fail with a clear error rather than crashing
+  //    with an uninformative fatal throw inside Reconstruction::Read().
   if (!IsReconstructionComplete(options_.prior_reconstruction_path)) {
-    LOG(WARNING)
+    LOG(ERROR)
         << "IncrementalGlobalPipeline: prior reconstruction at "
         << options_.prior_reconstruction_path
-        << " is incomplete or still being written. "
-           "Falling back to standard global reconstruction.";
-    auto reconstruction = std::make_shared<Reconstruction>();
-    GlobalMapperOptions mapper_opts = options_.mapper;
-    mapper_opts.image_path = options_.image_path;
-    mapper_opts.num_threads = options_.num_threads;
-    mapper_opts.random_seed = options_.random_seed;
-
-    GlobalMapper mapper(database_cache_);
-    mapper.BeginReconstruction(reconstruction);
-
-    Timer t;
-    t.Start();
-    mapper.Solve(mapper_opts);
-    LOG(INFO) << "Reconstruction done in " << t.ElapsedSeconds() << " s";
-
-    AlignReconstructionToOrigRigScales(database_cache_->Rigs(),
-                                       reconstruction.get());
-
-    Reconstruction& out =
-        *reconstruction_manager_->Get(reconstruction_manager_->Add());
-    out = *reconstruction;
-    if (!options_.image_path.empty()) {
-      out.ExtractColorsForAllImages(options_.image_path);
-    }
+        << " is incomplete or missing (cameras/images/points3D files not "
+           "found). Ensure the previous reconstruction has finished writing "
+           "before starting a new incremental run.";
     return;
   }
 

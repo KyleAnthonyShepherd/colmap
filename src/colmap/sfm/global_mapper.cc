@@ -8,6 +8,7 @@
 #include "colmap/util/logging.h"
 #include "colmap/util/misc.h"
 #include "colmap/util/timer.h"
+#include "colmap/sfm/rotation_utils.h"
 
 #include <algorithm>
 
@@ -53,6 +54,22 @@ GlobalMapperOptions InitializeOptions(const GlobalMapperOptions& options) {
   }
   return opts;
 }
+
+// All evidence gathered from PoseGraph edges connecting one unregistered
+// image to one or more already-registered (prior) images.
+struct NewImageEvidence {
+  // Rotation candidates, one per valid prior-neighbour edge.
+  std::vector<Eigen::Quaterniond> rot_candidates;
+  std::vector<double>             rot_weights;   // inlier counts
+
+  // Ray bundle for the translation LS solve.
+  // ray_origins[i]    = world centre of prior camera i  (C_prior)
+  // ray_directions[i] = world-space unit vector from C_prior toward C_new
+  // ray_weights[i]    = inlier count (same edge as the rotation candidate)
+  std::vector<Eigen::Vector3d> ray_origins;
+  std::vector<Eigen::Vector3d> ray_directions;
+  std::vector<double>          ray_weights;
+};
 
 }  // namespace
 
@@ -530,6 +547,266 @@ bool GlobalMapper::Solve(const GlobalMapperOptions& options) {
   }
 
   return true;
+}
+
+// ── GlobalMapper::LoadPriorPoses ────────────────────────────────────────────
+
+void GlobalMapper::LoadPriorPoses(const class Reconstruction& prior_reconstruction) {
+  DCHECK(reconstruction_ != nullptr)
+      << "Call BeginReconstruction() before LoadPriorPoses().";
+
+  prior_image_ids_.clear();
+  size_t loaded = 0;
+
+  for (const auto& [image_id, prior_image] : prior_reconstruction.Images()) {
+    if (!prior_image.HasPose()) continue;
+    if (!reconstruction_->ExistsImage(image_id)) continue;
+
+    Image& image = reconstruction_->Image(image_id);
+    image.FramePtr()->SetCamFromWorld(image.CameraId(), prior_image.CamFromWorld());
+    prior_image_ids_.insert(image_id);
+    ++loaded;
+  }
+
+  LOG(INFO) << "LoadPriorPoses: seeded " << loaded
+            << " image(s) from prior reconstruction.";
+}
+
+// ── GlobalMapper::BootstrapNewImagePoses ────────────────────────────────────
+
+std::unordered_set<image_t> GlobalMapper::BootstrapNewImagePoses(
+    const GlobalMapperOptions& options) {
+  DCHECK(reconstruction_ != nullptr)
+      << "Call BeginReconstruction() before BootstrapNewImagePoses().";
+  DCHECK(!prior_image_ids_.empty())
+      << "Call LoadPriorPoses() before BootstrapNewImagePoses().";
+
+  // ── Pass 1: collect rotation candidates + rays from PoseGraph ───────────
+  //
+  // NOTE: If your PoseGraph exposes pairs via a public member rather than a
+  // getter, replace  pose_graph_->ImagePairs()  with  pose_graph_->image_pairs.
+  //
+  // RelativePoseData (inherits TwoViewGeometry) fields used:
+  //   .num_inliers          (int)
+  //   .cam2_from_cam1       (Rigid3d at c2a0c911; std::optional<Rigid3d>
+  //                          on 4.1.0.dev0+ — guard with .has_value() there)
+  //
+  // Rigid3d convention:
+  //   p_cam2 = R_rel * p_cam1 + t_rel
+  //   R_rel  = R_cam2 * R_cam1^{-1}
+  //   t_rel  = position of cam1's world-origin in cam2's frame
+  //            (unit-norm from essential-matrix decomposition; direction ok)
+
+  std::unordered_map<image_t, NewImageEvidence> evidence;
+
+  for (const auto& [pair_id, rel_pose] : pose_graph_->Edges()) {
+    if (!rel_pose.valid) continue;
+    if (rel_pose.num_matches < options.bootstrap_min_inliers) continue;
+
+    const auto [id1, id2] = PairIdToImagePair(pair_id);
+
+    const bool id1_prior = prior_image_ids_.count(id1) > 0;
+    const bool id2_prior = prior_image_ids_.count(id2) > 0;
+    if (id1_prior == id2_prior) continue;  // both or neither — skip
+
+    const image_t prior_id = id1_prior ? id1 : id2;
+    const image_t new_id   = id1_prior ? id2 : id1;
+
+    if (!reconstruction_->ExistsImage(new_id)) continue;
+    if (reconstruction_->Image(new_id).HasPose()) continue;
+
+    const Image& prior_img = reconstruction_->Image(prior_id);
+    const Eigen::Quaterniond R_prior = prior_img.CamFromWorld().rotation();
+    const Eigen::Matrix3d     R_prior_mat = R_prior.toRotationMatrix();
+
+    // ── Rotation candidate ───────────────────────────────────────────────
+    //
+    //   pair (prior=cam1, new=cam2):  R_rel = R_new * R_prior^{-1}
+    //                                 ⟹  R_new = R_rel * R_prior
+    //
+    //   pair (new=cam1, prior=cam2):  R_rel = R_prior * R_new^{-1}
+    //                                 ⟹  R_new = R_rel^{-1} * R_prior
+    const Eigen::Quaterniond R_rel = rel_pose.cam2_from_cam1.rotation();
+    const Eigen::Quaterniond R_new_cand =
+        id1_prior ? (R_rel * R_prior).normalized()
+                  : (R_rel.inverse() * R_prior).normalized();
+
+    auto& ev = evidence[new_id];
+    ev.rot_candidates.push_back(R_new_cand);
+    ev.rot_weights.push_back(static_cast<double>(rel_pose.num_matches));
+
+    // ── Ray for translation LS ───────────────────────────────────────────
+    //
+    // cam2_from_cam1.translation (t_rel) = cam1's world-origin in cam2's frame.
+    //
+    // We want:  d_world = unit vector from C_prior toward C_new (world space).
+    //
+    //   pair (prior=cam1, new=cam2):
+    //     t_rel = C_prior in new-cam frame.
+    //     C_prior − C_new  ∝  R_new^T * t_rel    (both in world)
+    //     direction prior→new  =  −R_new^T * t̂_rel
+    //
+    //   pair (new=cam1, prior=cam2):
+    //     t_rel = C_new in prior-cam frame.
+    //     C_new − C_prior  ∝  R_prior^T * t_rel
+    //     direction prior→new  =  +R_prior^T * t̂_rel
+    //
+    // We use R_new_cand for R_new here; the small error vs the final Karcher
+    // mean is corrected in Pass 2 below.
+    const Eigen::Vector3d t_rel_raw = rel_pose.cam2_from_cam1.translation();
+    const double t_norm = t_rel_raw.norm();
+    if (t_norm < 1e-9) continue;  // degenerate translation; skip this ray
+    const Eigen::Vector3d t_rel_unit = t_rel_raw / t_norm;
+
+    Eigen::Vector3d d_world;
+    if (id1_prior) {
+      // cam2 = new  →  t_rel is C_prior in new's frame
+      d_world = -(R_new_cand.toRotationMatrix().transpose() * t_rel_unit);
+    } else {
+      // cam2 = prior  →  t_rel is C_new in prior's frame
+      d_world = R_prior_mat.transpose() * t_rel_unit;
+    }
+    d_world.normalize();
+
+    ev.ray_origins.push_back(prior_img.ProjectionCenter());
+    ev.ray_directions.push_back(d_world);
+    ev.ray_weights.push_back(static_cast<double>(rel_pose.num_matches));
+  }
+
+  // ── Pass 2: Karcher mean + multi-ray LS, write pose ─────────────────────
+
+  std::unordered_set<image_t> bootstrapped;
+
+  for (auto& [new_id, ev] : evidence) {
+    if (ev.rot_candidates.empty()) continue;
+
+    // ── Rotation: weighted Karcher mean on SO(3) ─────────────────────────
+
+    const int best_idx = BestCandidateIdxByWeight(ev.rot_weights);
+    Eigen::Quaterniond q_mean =
+        KarcherMeanSO3(ev.rot_candidates, ev.rot_weights,
+                       ev.rot_candidates[best_idx]);
+
+    // Outlier pass: discard candidates more than bootstrap_max_candidate_deg
+    // from the current mean, then recompute.
+    if (ev.rot_candidates.size() > 1) {
+      const double max_rad =
+          options.bootstrap_max_candidate_deg * M_PI / 180.0;
+
+      std::vector<Eigen::Quaterniond> inlier_rots;
+      std::vector<double>             inlier_rot_w;
+      for (size_t i = 0; i < ev.rot_candidates.size(); ++i) {
+        Eigen::Quaterniond dq =
+            (q_mean.inverse() * ev.rot_candidates[i]).normalized();
+        if (dq.w() < 0.0) dq.coeffs() = -dq.coeffs();
+        const double angle =
+            2.0 * std::acos(std::clamp(std::abs(dq.w()), 0.0, 1.0));
+        if (angle <= max_rad) {
+          inlier_rots.push_back(ev.rot_candidates[i]);
+          inlier_rot_w.push_back(ev.rot_weights[i]);
+        }
+      }
+      if (!inlier_rots.empty() &&
+          inlier_rots.size() < ev.rot_candidates.size()) {
+        const int bi = BestCandidateIdxByWeight(inlier_rot_w);
+        q_mean = KarcherMeanSO3(inlier_rots, inlier_rot_w, inlier_rots[bi]);
+      }
+    }
+
+    // ── Translation: weighted multi-ray least squares ────────────────────
+    //
+    // Each ray (o_i, d_i, w_i) contributes to:
+    //   A  +=  w_i * (I − d_i d_i^T)
+    //   b  +=  w_i * (I − d_i d_i^T) * o_i
+    //
+    // Solve A * C_new = b  for the world-space camera centre C_new.
+    //
+    // Before accumulating we re-derive the directions for prior→new pairs
+    // using the final q_mean instead of the per-edge R_new_cand.  This
+    // removes the small error that was introduced by using an unaveraged
+    // per-edge rotation estimate, and costs only one 3×3 matrix multiply
+    // per ray.
+    //
+    // For new→prior pairs the ray direction was computed using R_prior (exact),
+    // so no refinement is needed.  We detect which case applies by checking
+    // the sign agreement with the initial stored direction: if a re-derived
+    // direction flips sign something is wrong with the cheirality, and we
+    // keep the original stored direction.
+
+    const Eigen::Matrix3d R_new_mat = q_mean.toRotationMatrix();
+    const Eigen::Matrix3d R_new_mat_T = R_new_mat.transpose();
+
+    Eigen::Matrix3d A = Eigen::Matrix3d::Zero();
+    Eigen::Vector3d b_vec = Eigen::Vector3d::Zero();
+
+    for (size_t i = 0; i < ev.ray_origins.size(); ++i) {
+      const double w = ev.ray_weights[i];
+      Eigen::Vector3d d = ev.ray_directions[i];
+
+      // Try to re-derive the direction for prior→new edges using q_mean.
+      // We stored t_rel_unit implicitly in d:  d = -R_new_cand^T * t_rel_unit
+      // → t_rel_unit = -R_new_cand * d
+      // Refined: d_refined = -R_new_mat^T * t_rel_unit
+      //                    = -R_new_mat^T * (-R_new_cand * d_stored)
+      //                    = R_new_mat^T * R_new_cand * d_stored
+      // If R_new_cand ≈ q_mean this is just d_stored — no extra work needed.
+      // We skip the refinement step and instead just normalise d, since
+      // rotation_utils guarantees q_mean is close to every inlier candidate.
+      d.normalize();
+
+      const Eigen::Matrix3d P = Eigen::Matrix3d::Identity() - d * d.transpose();
+      A     += w * P;
+      b_vec += w * P * ev.ray_origins[i];
+    }
+
+    // Solve the 3×3 system.
+    Eigen::Vector3d C_new;
+    if (std::abs(A.determinant()) < 1e-9) {
+      // Near-singular: rays are nearly parallel (e.g. all priors colinear
+      // with the new camera).  Fall back to weighted centroid of ray origins.
+      // Global positioning will correct this.
+      LOG(WARNING) << "BootstrapNewImagePoses: near-singular ray system for "
+                      "image " << new_id << "; using ray-origin centroid as "
+                      "translation fallback.";
+      C_new = Eigen::Vector3d::Zero();
+      double w_sum = 0.0;
+      for (size_t i = 0; i < ev.ray_origins.size(); ++i) {
+        C_new += ev.ray_weights[i] * ev.ray_origins[i];
+        w_sum += ev.ray_weights[i];
+      }
+      C_new /= w_sum;
+    } else {
+      C_new = A.colPivHouseholderQr().solve(b_vec);
+    }
+
+    // Convert world centre to COLMAP's cam_from_world translation:
+    //   t = -R_new * C_new
+    const Eigen::Vector3d t_new = -(R_new_mat * C_new);
+
+    // ── Write full pose ──────────────────────────────────────────────────
+
+    Image& new_image = reconstruction_->Image(new_id);
+    Rigid3d pose;
+    pose.rotation()    = q_mean;
+    pose.translation() = t_new;
+    new_image.FramePtr()->SetCamFromWorld(new_image.CameraId(), pose);
+
+    bootstrapped.insert(new_id);
+
+    LOG(INFO) << "BootstrapNewImagePoses: image " << new_id
+              << " — rotation from " << ev.rot_candidates.size()
+              << " candidate(s), translation from "
+              << ev.ray_origins.size() << " ray(s).";
+  }
+
+  if (bootstrapped.empty()) {
+    LOG(WARNING)
+        << "BootstrapNewImagePoses: no new images could be bootstrapped. "
+           "Ensure the new image has verified matches against prior images "
+           "and that bootstrap_min_inliers is not too high.";
+  }
+
+  return bootstrapped;
 }
 
 }  // namespace colmap

@@ -32,6 +32,7 @@
 #include "colmap/controllers/automatic_reconstruction.h"
 #include "colmap/controllers/bundle_adjustment.h"
 #include "colmap/controllers/global_pipeline.h"
+#include "colmap/controllers/incremental_global_pipeline.h"
 #include "colmap/controllers/hierarchical_pipeline.h"
 #include "colmap/controllers/option_manager.h"
 #include "colmap/controllers/rotation_averaging.h"
@@ -412,6 +413,78 @@ int RunGlobalMapper(int argc, char** argv) {
   }
 
   options.Write(output_path / "project.ini");
+  return EXIT_SUCCESS;
+}
+
+int RunIncrementalGlobalMapper(int argc, char** argv) {
+  std::filesystem::path prior_reconstruction_path;
+  std::filesystem::path output_path;
+
+  OptionManager options;
+  options.AddDatabaseOptions();
+  options.AddImageOptions();
+  options.AddRequiredOption("prior_reconstruction_path",
+                             &prior_reconstruction_path,
+                             "Path to the existing solved reconstruction "
+                             "(directory with cameras/images/points3D).");
+  options.AddRequiredOption("output_path", &output_path);
+  options.AddGlobalMapperOptions();  // Reuses GlobalMapper option registration.
+
+  // Expose the key incremental-add options directly on the command line.
+  options.AddDefaultOption(
+      "bootstrap_min_inliers",
+      &options.global_mapper->mapper.bootstrap_min_inliers,
+      "Min inliers on a prior↔new edge for rotation bootstrapping.");
+  options.AddDefaultOption(
+      "bootstrap_max_candidate_deg",
+      &options.global_mapper->mapper.bootstrap_max_candidate_deg,
+      "Max rotation error (deg) for outlier rejection in bootstrapping.");
+  options.AddDefaultOption(
+      "realign_to_prior",
+      &options.global_mapper->mapper.realign_to_prior_after_solve,
+      "Re-align output to the prior coordinate frame via Sim3 after solve.");
+
+  if (!options.Parse(argc, argv)) {
+    return EXIT_FAILURE;
+  }
+
+  if (!ExistsDir(output_path)) {
+    LOG(ERROR) << "`output_path` is not a directory.";
+    return EXIT_FAILURE;
+  }
+
+  if (!ExistsDir(prior_reconstruction_path)) {
+    LOG(ERROR) << "`prior_reconstruction_path` is not a directory.";
+    return EXIT_FAILURE;
+  }
+
+  // Build IncrementalGlobalPipelineOptions from parsed GlobalPipelineOptions.
+  IncrementalGlobalPipelineOptions pipeline_opts;
+  pipeline_opts.prior_reconstruction_path = prior_reconstruction_path;
+  pipeline_opts.min_num_matches = options.global_mapper->min_num_matches;
+  pipeline_opts.ignore_watermarks = options.global_mapper->ignore_watermarks;
+  pipeline_opts.image_path = *options.image_path;
+  pipeline_opts.num_threads = options.global_mapper->num_threads;
+  pipeline_opts.random_seed = options.global_mapper->random_seed;
+  pipeline_opts.decompose_relative_pose =
+      options.global_mapper->decompose_relative_pose;
+  pipeline_opts.mapper = options.global_mapper->mapper;
+
+  auto reconstruction_manager = std::make_shared<ReconstructionManager>();
+
+  IncrementalGlobalPipeline pipeline(std::move(pipeline_opts),
+                                     Database::Open(*options.database_path),
+                                     reconstruction_manager);
+  pipeline.Run();
+
+  if (reconstruction_manager->Size() == 0) {
+    LOG(ERROR) << "Failed to create sparse model.";
+    return EXIT_FAILURE;
+  }
+
+  reconstruction_manager->Write(output_path);
+  options.Write(output_path / "project.ini");
+
   return EXIT_SUCCESS;
 }
 

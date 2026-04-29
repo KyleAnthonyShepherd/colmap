@@ -43,6 +43,7 @@ COLMAP_ADD_LIBRARY(
         matcher_cache.h matcher_cache.cc
         pairing.h pairing.cc
         global_pipeline.h global_pipeline.cc
+	incremental_global_pipeline.h incremental_global_pipeline.cc
         image_reader.h image_reader.cc
         incremental_pipeline.h incremental_pipeline.cc
         option_manager.h option_manager.cc

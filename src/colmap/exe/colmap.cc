@@ -115,6 +115,7 @@ int main(int argc, char** argv) {
   commands.emplace_back("image_undistorter", &colmap::RunImageUndistorter);
   commands.emplace_back("image_undistorter_standalone",
                         &colmap::RunImageUndistorterStandalone);
+  commands.emplace_back("incremental_global_mapper", &colmap::RunIncrementalGlobalMapper);
   commands.emplace_back("mapper", &colmap::RunMapper);
   commands.emplace_back("matches_importer", &colmap::RunMatchesImporter);
 #if defined(COLMAP_MVS_ENABLED)

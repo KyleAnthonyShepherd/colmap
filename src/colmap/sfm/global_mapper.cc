@@ -564,6 +564,7 @@ void GlobalMapper::LoadPriorPoses(const class Reconstruction& prior_reconstructi
 
     Image& image = reconstruction_->Image(image_id);
     image.FramePtr()->SetCamFromWorld(image.CameraId(), prior_image.CamFromWorld());
+    reconstruction_->RegisterFrame(image.FrameId());
     prior_image_ids_.insert(image_id);
     ++loaded;
   }
@@ -790,6 +791,7 @@ std::unordered_set<image_t> GlobalMapper::BootstrapNewImagePoses(
     pose.rotation()    = q_mean;
     pose.translation() = t_new;
     new_image.FramePtr()->SetCamFromWorld(new_image.CameraId(), pose);
+    reconstruction_->RegisterFrame(new_image.FrameId());
 
     bootstrapped.insert(new_id);
 

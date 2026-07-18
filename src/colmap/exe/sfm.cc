@@ -443,6 +443,11 @@ int RunIncrementalGlobalMapper(int argc, char** argv) {
       "realign_to_prior",
       &options.global_mapper->mapper.realign_to_prior_after_solve,
       "Re-align output to the prior coordinate frame via Sim3 after solve.");
+  options.AddDefaultOption(
+      "bootstrap_max_gravity_error_deg",
+      &options.global_mapper->mapper.bootstrap_max_gravity_error_deg,
+      "Max angle (deg) between measured and candidate-implied gravity "
+      "before a bootstrap candidate is rejected; <= 0 disables.");
 
   if (!options.Parse(argc, argv)) {
     return EXIT_FAILURE;

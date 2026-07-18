@@ -123,6 +123,14 @@ struct GlobalMapperOptions {
   // the prior image centres.  Always recommended when skip_rotation_averaging
   // = true to correct any metric drift from global positioning.
   bool realign_to_prior_after_solve = true;
+
+  // Maximum disagreement (degrees) between the measured gravity direction of
+  // a new image (from its pose prior) and the gravity direction implied by a
+  // rotation candidate before the candidate is rejected. Requires gravity
+  // priors on both the new image and the prior images. This is a stronger
+  // outlier test than distance-from-mean when only 2-3 candidates exist.
+  // Set <= 0 to disable.
+  double bootstrap_max_gravity_error_deg = 15.0;
   // ─────────────────────────────────────────────────────────────────────
 };
 
@@ -156,10 +164,29 @@ struct BootstrapEdgeObservation {
 // all rays. Falls back to the weighted centroid of the prior centres when
 // the ray system is near-singular (e.g. a single ray or colinear priors).
 //
+// Gravity consistency gate for rotation candidates.
+struct BootstrapGravityGate {
+  // Measured gravity direction in the new image's camera frame (unit norm),
+  // e.g. from the image's pose prior.
+  Eigen::Vector3d gravity_in_new_cam;
+  // Gravity direction in the world frame of the prior reconstruction (unit
+  // norm), e.g. averaged from the prior images' gravity priors and poses.
+  Eigen::Vector3d gravity_in_world;
+  // Maximum angle (degrees) between measured and candidate-implied gravity.
+  double max_error_deg = 15.0;
+};
+
 // Returns std::nullopt when `observations` is empty.
+//
+// When `gravity_gate` is set, observations whose implied camera-frame
+// gravity (R_candidate * gravity_in_world) disagrees with the measured
+// gravity by more than max_error_deg are discarded before averaging. If all
+// observations fail the gate, solving proceeds ungated with a warning (a
+// single bad accelerometer sample must not block registration).
 std::optional<Rigid3d> SolvePoseFromPriorEdges(
     const std::vector<BootstrapEdgeObservation>& observations,
-    double max_candidate_deg);
+    double max_candidate_deg,
+    const std::optional<BootstrapGravityGate>& gravity_gate = std::nullopt);
 
 class GlobalMapper {
  public:

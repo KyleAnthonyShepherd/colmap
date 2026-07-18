@@ -582,9 +582,60 @@ void GlobalMapper::LoadPriorPoses(const class Reconstruction& prior_reconstructi
 // ── SolvePoseFromPriorEdges ──────────────────────────────────────────────────────
 
 std::optional<Rigid3d> SolvePoseFromPriorEdges(
-    const std::vector<BootstrapEdgeObservation>& observations,
-    const double max_candidate_deg) {
-  if (observations.empty()) return std::nullopt;
+    const std::vector<BootstrapEdgeObservation>& all_observations,
+    const double max_candidate_deg,
+    const std::optional<BootstrapGravityGate>& gravity_gate) {
+  if (all_observations.empty()) return std::nullopt;
+
+  // ── Pass 0: gravity gate ──────────────────────────────────────────────
+  //
+  // A rotation candidate implies a camera-frame gravity direction
+  // R_candidate * g_world. Candidates that disagree with the measured
+  // gravity beyond the threshold are outliers regardless of their weight —
+  // discard the whole observation (its translation ray depends on the same
+  // bad relative pose).
+  std::vector<BootstrapEdgeObservation> gated_observations;
+  const std::vector<BootstrapEdgeObservation>* observations_ptr =
+      &all_observations;
+  if (gravity_gate.has_value()) {
+    const Eigen::Vector3d g_meas =
+        gravity_gate->gravity_in_new_cam.normalized();
+    const Eigen::Vector3d g_world = gravity_gate->gravity_in_world.normalized();
+    const double max_dot_angle_rad =
+        gravity_gate->max_error_deg * M_PI / 180.0;
+
+    for (const BootstrapEdgeObservation& obs : all_observations) {
+      const Eigen::Quaterniond R_prior = obs.prior_cam_from_world.rotation();
+      const Eigen::Quaterniond R_rel = obs.cam2_from_cam1.rotation();
+      const Eigen::Quaterniond R_new_cand =
+          obs.prior_is_cam1 ? (R_rel * R_prior).normalized()
+                            : (R_rel.inverse() * R_prior).normalized();
+      const Eigen::Vector3d g_implied = R_new_cand * g_world;
+      const double angle = std::acos(
+          std::clamp(g_implied.dot(g_meas), -1.0, 1.0));
+      if (angle <= max_dot_angle_rad) {
+        gated_observations.push_back(obs);
+      }
+    }
+
+    if (gated_observations.empty()) {
+      LOG(WARNING)
+          << "SolvePoseFromPriorEdges: all " << all_observations.size()
+          << " candidate(s) violate the gravity prior by more than "
+          << gravity_gate->max_error_deg
+          << " deg; proceeding without the gravity gate (measured gravity "
+             "may be unreliable).";
+    } else {
+      if (gated_observations.size() < all_observations.size()) {
+        LOG(INFO) << "SolvePoseFromPriorEdges: gravity gate discarded "
+                  << all_observations.size() - gated_observations.size()
+                  << " of " << all_observations.size() << " candidate(s).";
+      }
+      observations_ptr = &gated_observations;
+    }
+  }
+  const std::vector<BootstrapEdgeObservation>& observations =
+      *observations_ptr;
 
   // Rigid3d convention:
   //   p_cam2 = R_rel * p_cam1 + t_rel
@@ -785,12 +836,53 @@ std::unordered_set<image_t> GlobalMapper::BootstrapNewImagePoses(
     evidence[new_id].push_back(std::move(obs));
   }
 
+  // Gravity gate setup: collect per-image gravity priors and derive the
+  // world gravity direction from the prior images' priors and poses.
+  std::unordered_map<image_t, Eigen::Vector3d> image_to_gravity;
+  std::optional<Eigen::Vector3d> world_gravity;
+  if (options.bootstrap_max_gravity_error_deg > 0) {
+    for (const PosePrior& pose_prior : database_cache_->PosePriors()) {
+      if (pose_prior.corr_data_id.sensor_id.type == SensorType::CAMERA &&
+          pose_prior.HasGravity()) {
+        image_to_gravity[pose_prior.corr_data_id.id] =
+            pose_prior.gravity.normalized();
+      }
+    }
+
+    Eigen::Vector3d world_gravity_sum = Eigen::Vector3d::Zero();
+    size_t num_prior_gravities = 0;
+    for (const image_t prior_id : prior_image_ids_) {
+      const auto it = image_to_gravity.find(prior_id);
+      if (it == image_to_gravity.end()) continue;
+      // g_world = R_cam_from_world^T * g_cam.
+      const Eigen::Quaterniond R_prior =
+          reconstruction_->Image(prior_id).CamFromWorld().rotation();
+      world_gravity_sum += R_prior.inverse() * it->second;
+      ++num_prior_gravities;
+    }
+    if (num_prior_gravities > 0 && world_gravity_sum.norm() > 1e-6) {
+      world_gravity = world_gravity_sum.normalized();
+    }
+  }
+
   // Solve each new image's pose from its accumulated evidence.
   std::unordered_set<image_t> bootstrapped;
 
   for (const auto& [new_id, observations] : evidence) {
+    std::optional<BootstrapGravityGate> gravity_gate;
+    if (world_gravity.has_value()) {
+      const auto it = image_to_gravity.find(new_id);
+      if (it != image_to_gravity.end()) {
+        BootstrapGravityGate gate;
+        gate.gravity_in_new_cam = it->second;
+        gate.gravity_in_world = *world_gravity;
+        gate.max_error_deg = options.bootstrap_max_gravity_error_deg;
+        gravity_gate = gate;
+      }
+    }
+
     const std::optional<Rigid3d> pose = SolvePoseFromPriorEdges(
-        observations, options.bootstrap_max_candidate_deg);
+        observations, options.bootstrap_max_candidate_deg, gravity_gate);
     if (!pose.has_value()) continue;
 
     Image& new_image = reconstruction_->Image(new_id);

@@ -212,6 +212,81 @@ TEST(SolvePoseFromPriorEdges, EmptyObservationsReturnsNullopt) {
       SolvePoseFromPriorEdges({}, /*max_candidate_deg=*/10.0).has_value());
 }
 
+// ── Gravity gate ───────────────────────────────────────────────────────────
+
+BootstrapGravityGate MakeGravityGate(const Rigid3d& new_pose,
+                                     const Eigen::Vector3d& gravity_in_world,
+                                     const double max_error_deg = 15.0) {
+  BootstrapGravityGate gate;
+  gate.gravity_in_world = gravity_in_world;
+  // Measured gravity = ground-truth gravity in the new camera's frame.
+  gate.gravity_in_new_cam = new_pose.rotation() * gravity_in_world;
+  gate.max_error_deg = max_error_deg;
+  return gate;
+}
+
+TEST(SolvePoseFromPriorEdges, GravityGateOverridesInlierWeight) {
+  SolverFixture f;
+  const Eigen::Vector3d gravity_in_world = Eigen::Vector3d::UnitY();
+
+  // Two candidates only: the HIGHER-weight one has a rotation 30 degrees off
+  // (tilting the implied gravity), the lower-weight one is correct. With so
+  // few candidates the weighted mean + distance-from-mean re-pass follows
+  // the heavy outlier; the gravity gate must reject it instead.
+  std::vector<BootstrapEdgeObservation> obs;
+
+  const BootstrapGravityGate gate = MakeGravityGate(f.new_pose,
+                                                    gravity_in_world);
+
+  BootstrapEdgeObservation outlier =
+      f.MakeObservation(0, /*prior_is_cam1=*/true, /*weight=*/500.0);
+  // Perturb about an axis orthogonal to the measured gravity so the implied
+  // gravity moves by the full perturbation angle.
+  const Eigen::Vector3d perturb_axis = gate.gravity_in_new_cam.unitOrthogonal();
+  outlier.cam2_from_cam1.rotation() =
+      (Eigen::Quaterniond(Eigen::AngleAxisd(30.0 * M_PI / 180.0,
+                                            perturb_axis)) *
+       outlier.cam2_from_cam1.rotation())
+          .normalized();
+  obs.push_back(outlier);
+  obs.push_back(f.MakeObservation(1, /*prior_is_cam1=*/true, /*weight=*/50.0));
+  obs.push_back(f.MakeObservation(2, /*prior_is_cam1=*/true, /*weight=*/40.0));
+
+  // Without the gate the heavy outlier drags the mean far off.
+  const auto ungated = SolvePoseFromPriorEdges(obs, /*max_candidate_deg=*/10.0);
+  ASSERT_TRUE(ungated.has_value());
+  EXPECT_GT(RotationErrorDeg(*ungated, f.new_pose), 5.0);
+
+  // With the gate, the outlier candidate is discarded and recovery is exact.
+  const auto gated =
+      SolvePoseFromPriorEdges(obs, /*max_candidate_deg=*/10.0, gate);
+  ASSERT_TRUE(gated.has_value());
+  EXPECT_LT(RotationErrorDeg(*gated, f.new_pose), 1e-6);
+}
+
+TEST(SolvePoseFromPriorEdges, AllCandidatesViolatingGravityFallsBack) {
+  SolverFixture f;
+  std::vector<BootstrapEdgeObservation> obs;
+  for (size_t i = 0; i < f.prior_poses.size(); ++i) {
+    obs.push_back(f.MakeObservation(i, /*prior_is_cam1=*/true));
+  }
+
+  // A gate whose measured gravity disagrees with every candidate: solving
+  // must proceed ungated rather than fail, and the observations are exact so
+  // recovery stays exact.
+  BootstrapGravityGate bogus_gate;
+  bogus_gate.gravity_in_world = Eigen::Vector3d::UnitY();
+  bogus_gate.gravity_in_new_cam =
+      -(f.new_pose.rotation() * Eigen::Vector3d::UnitY());
+  bogus_gate.max_error_deg = 15.0;
+
+  const auto pose =
+      SolvePoseFromPriorEdges(obs, /*max_candidate_deg=*/10.0, bogus_gate);
+  ASSERT_TRUE(pose.has_value());
+  EXPECT_LT(RotationErrorDeg(*pose, f.new_pose), 1e-6);
+  EXPECT_LT((Center(*pose) - Center(f.new_pose)).norm(), 1e-6);
+}
+
 // ── BootstrapNewImagePoses (graph walk, synthetic database) ────────────────
 
 std::shared_ptr<DatabaseCache> CreateDatabaseCache(const Database& database) {
@@ -273,6 +348,48 @@ void TestHoldOneOut(const size_t hold_out_rank) {
 TEST(BootstrapNewImagePoses, HoldOutFirstImage) { TestHoldOneOut(0); }
 TEST(BootstrapNewImagePoses, HoldOutMiddleImage) { TestHoldOneOut(3); }
 TEST(BootstrapNewImagePoses, HoldOutLastImage) { TestHoldOneOut(5); }
+
+TEST(BootstrapNewImagePoses, WithGravityPriorsInDatabase) {
+  SetPRNGSeed(1);
+  const auto database_path = CreateTestDir() / "database_gravity.db";
+
+  auto database = Database::Open(database_path);
+  Reconstruction gt_reconstruction;
+  SyntheticDatasetOptions synthetic_dataset_options;
+  synthetic_dataset_options.num_rigs = 1;
+  synthetic_dataset_options.num_cameras_per_rig = 1;
+  synthetic_dataset_options.num_frames_per_rig = 6;
+  synthetic_dataset_options.num_points3D = 100;
+  synthetic_dataset_options.two_view_geometry_has_relative_pose = true;
+  synthetic_dataset_options.prior_gravity = true;
+  SynthesizeDataset(
+      synthetic_dataset_options, &gt_reconstruction, database.get());
+
+  std::vector<image_t> reg_ids = gt_reconstruction.RegImageIds();
+  std::sort(reg_ids.begin(), reg_ids.end());
+  const image_t held_out = reg_ids[reg_ids.size() / 2];
+
+  Reconstruction prior = gt_reconstruction;
+  prior.DeRegisterFrame(prior.Image(held_out).FrameId());
+
+  auto reconstruction = std::make_shared<Reconstruction>();
+  GlobalMapper mapper(CreateDatabaseCache(*database));
+  mapper.BeginReconstruction(reconstruction);
+  mapper.LoadPriorPoses(prior);
+
+  // The gravity gate is active (priors exist for every image) and all
+  // observations are consistent, so recovery must remain exact.
+  const GlobalMapperOptions options;
+  ASSERT_GT(options.bootstrap_max_gravity_error_deg, 0);
+  const std::unordered_set<image_t> bootstrapped =
+      mapper.BootstrapNewImagePoses(options);
+
+  ASSERT_EQ(bootstrapped.count(held_out), 1);
+  const Rigid3d& recovered = reconstruction->Image(held_out).CamFromWorld();
+  const Rigid3d& gt_pose = gt_reconstruction.Image(held_out).CamFromWorld();
+  EXPECT_LT(RotationErrorDeg(recovered, gt_pose), 1e-2);
+  EXPECT_LT((Center(recovered) - Center(gt_pose)).norm(), 1e-3);
+}
 
 TEST(BootstrapNewImagePoses, MinInliersTooHighBootstrapsNothing) {
   SetPRNGSeed(1);

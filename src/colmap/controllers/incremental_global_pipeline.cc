@@ -232,8 +232,6 @@ void IncrementalGlobalPipeline::Run() {
     LOG(INFO) << "Extracting colors ...";
     out.ExtractColorsForAllImages(options_.image_path);
   }
-
-  if (warn_focal) WarnInsufficientPriorFocalLengths();
 }
 
 }  // namespace colmap

@@ -10,7 +10,8 @@
 
 #include <filesystem>
 #include <limits>
-// ── INCREMENTAL-ADD (new include) ─────────────────────────────────────────
+// ── INCREMENTAL-ADD (new includes) ────────────────────────────────────────
+#include <optional>
 #include <unordered_set>
 // ─────────────────────────────────────────────────────────────────────────
 
@@ -125,6 +126,41 @@ struct GlobalMapperOptions {
   // ─────────────────────────────────────────────────────────────────────
 };
 
+// ── INCREMENTAL-ADD FREE FUNCTIONS ─────────────────────────────────────────
+
+// Evidence from a single pose-graph edge connecting a new (unregistered)
+// image to a prior (registered) image.
+struct BootstrapEdgeObservation {
+  // Relative pose of the edge, in the pose graph's stored orientation.
+  Rigid3d cam2_from_cam1;
+  // True if the prior image is cam1 of the edge (and the new image cam2).
+  bool prior_is_cam1 = true;
+  // Absolute pose of the prior image.
+  Rigid3d prior_cam_from_world;
+  // Non-negative weight, typically the edge's verified match count.
+  double weight = 1.0;
+};
+
+// Solves the absolute pose of one new image from edges to prior images.
+//
+// Rotation: each edge contributes one candidate absolute rotation
+//   R_new = R_rel * R_prior        (prior is cam1)
+//   R_new = R_rel^{-1} * R_prior   (prior is cam2)
+// combined by a weighted Karcher mean on SO(3). When more than one candidate
+// exists, candidates further than `max_candidate_deg` from the mean are
+// discarded and the mean is recomputed.
+//
+// Translation: each edge with a non-degenerate relative translation
+// contributes a world-space ray from the prior camera centre toward the new
+// camera centre; the centre is the weighted least-squares point closest to
+// all rays. Falls back to the weighted centroid of the prior centres when
+// the ray system is near-singular (e.g. a single ray or colinear priors).
+//
+// Returns std::nullopt when `observations` is empty.
+std::optional<Rigid3d> SolvePoseFromPriorEdges(
+    const std::vector<BootstrapEdgeObservation>& observations,
+    double max_candidate_deg);
+
 class GlobalMapper {
  public:
   explicit GlobalMapper(std::shared_ptr<const DatabaseCache> database_cache);
@@ -219,6 +255,10 @@ class GlobalMapper {
   // Populated by LoadPriorPoses(); consumed by BootstrapNewImagePoses()
   // and by the optional realignment step in IncrementalGlobalPipeline::Run().
   std::unordered_set<image_t> prior_image_ids_;
+
+  // Subsampled prior 3D points (world coordinates) used for a cheap
+  // cheirality sanity check on bootstrapped poses.
+  std::vector<Eigen::Vector3d> prior_points_sample_;
   // ──────────────────────────────────────────────────────────────────────
 };
 

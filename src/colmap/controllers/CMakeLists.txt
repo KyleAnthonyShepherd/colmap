@@ -98,6 +98,11 @@ COLMAP_ADD_TEST(
     LINK_LIBS colmap_controllers
 )
 COLMAP_ADD_TEST(
+    NAME incremental_global_pipeline_test
+    SRCS incremental_global_pipeline_test.cc
+    LINK_LIBS colmap_controllers
+)
+COLMAP_ADD_TEST(
     NAME image_reader_test
     SRCS image_reader_test.cc
     LINK_LIBS colmap_controllers

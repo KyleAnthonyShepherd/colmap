@@ -543,6 +543,29 @@ void GlobalMapper::LoadPriorPoses(const class Reconstruction& prior_reconstructi
   prior_image_ids_.clear();
   size_t loaded = 0;
 
+  // Import the prior's refined camera intrinsics. The database may only
+  // hold coarse initial values (e.g. a focal prior from the field of view);
+  // the prior reconstruction's intrinsics were bundle-adjusted and are
+  // consistent with the prior poses and 3D points imported below. Without
+  // this, the windowed solve optimizes refined geometry against unrefined
+  // intrinsics and warps the model.
+  size_t loaded_cameras = 0;
+  for (const auto& [camera_id, prior_camera] : prior_reconstruction.Cameras()) {
+    if (!reconstruction_->ExistsCamera(camera_id)) continue;
+    struct Camera& camera = reconstruction_->Camera(camera_id);
+    if (camera.model_id != prior_camera.model_id ||
+        camera.width != prior_camera.width ||
+        camera.height != prior_camera.height) {
+      LOG(WARNING) << "LoadPriorPoses: camera " << camera_id
+                   << " differs in model/size between prior and database; "
+                      "keeping database intrinsics.";
+      continue;
+    }
+    camera.params = prior_camera.params;
+    camera.has_prior_focal_length = true;
+    ++loaded_cameras;
+  }
+
   for (const auto& [image_id, prior_image] : prior_reconstruction.Images()) {
     if (!prior_image.HasPose()) continue;
     if (!reconstruction_->ExistsImage(image_id)) {
@@ -576,7 +599,8 @@ void GlobalMapper::LoadPriorPoses(const class Reconstruction& prior_reconstructi
   }
 
   LOG(INFO) << "LoadPriorPoses: seeded " << loaded
-            << " image(s) from prior reconstruction.";
+            << " image(s) and imported intrinsics for " << loaded_cameras
+            << " camera(s) from prior reconstruction.";
 }
 
 // ── SolvePoseFromPriorEdges ──────────────────────────────────────────────────────
@@ -934,6 +958,51 @@ bool GlobalMapper::SolveIncrementalWindowed(
   THROW_CHECK(!new_image_ids.empty());
 
   const GlobalMapperOptions opts = InitializeOptions(options);
+
+  // 0. Seed the new images' camera intrinsics from refined prior cameras of
+  //    identical model and size. The database typically only carries a
+  //    coarse focal prior (e.g. from the field of view); starting local
+  //    bundle adjustment 30-40% off in focal length biases the refined
+  //    poses and the error compounds across adds. With a same-device
+  //    capture loop the refined prior intrinsics are a far better initial
+  //    value. (LoadPriorPoses already imported the prior cameras' params
+  //    for the prior images themselves.)
+  for (const image_t new_id : new_image_ids) {
+    if (!reconstruction_->ExistsImage(new_id)) continue;
+    struct Camera& camera = *reconstruction_->Image(new_id).CameraPtr();
+    if (prior_reconstruction.ExistsCamera(camera.camera_id)) continue;
+    std::vector<double> focals;
+    const struct Camera* donor = nullptr;
+    for (const auto& [prior_camera_id, prior_camera] :
+         prior_reconstruction.Cameras()) {
+      if (prior_camera.model_id == camera.model_id &&
+          prior_camera.width == camera.width &&
+          prior_camera.height == camera.height) {
+        focals.push_back(prior_camera.MeanFocalLength());
+        donor = &prior_camera;
+      }
+    }
+    if (donor == nullptr) continue;
+    // Use the params of the prior camera with the median mean focal.
+    std::nth_element(
+        focals.begin(), focals.begin() + focals.size() / 2, focals.end());
+    const double median_focal = focals[focals.size() / 2];
+    for (const auto& [prior_camera_id, prior_camera] :
+         prior_reconstruction.Cameras()) {
+      if (prior_camera.model_id == camera.model_id &&
+          prior_camera.width == camera.width &&
+          prior_camera.height == camera.height &&
+          prior_camera.MeanFocalLength() == median_focal) {
+        donor = &prior_camera;
+        break;
+      }
+    }
+    camera.params = donor->params;
+    LOG(INFO) << "SolveIncrementalWindowed: seeded intrinsics of new camera "
+              << camera.camera_id << " from prior camera "
+              << donor->camera_id << " (focal "
+              << donor->MeanFocalLength() << ").";
+  }
 
   // 1. Import the prior 3D points, re-linking their 2D-3D associations.
   //    Track elements referencing images or keypoints missing from the

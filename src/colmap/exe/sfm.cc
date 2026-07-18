@@ -500,6 +500,16 @@ int RunIncrementalGlobalMapper(int argc, char** argv) {
   reconstruction_manager->Write(output_path);
   options.Write(output_path / "project.ini");
 
+  // Persist the gauge anchors next to the reconstruction files so they
+  // survive the caller's promotion of the output directory and act as the
+  // fixed realignment reference for all subsequent incremental adds.
+  if (!pipeline.Anchors().Empty()) {
+    const std::filesystem::path numbered_dir = output_path / "0";
+    WriteAnchors((ExistsDir(numbered_dir) ? numbered_dir : output_path) /
+                     "anchors.txt",
+                 pipeline.Anchors());
+  }
+
   return EXIT_SUCCESS;
 }
 

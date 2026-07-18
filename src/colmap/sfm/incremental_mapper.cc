@@ -973,6 +973,13 @@ IncrementalMapper::AdjustLocalBundle(
       }
     }
 
+    // Fix explicitly constant frames (e.g. gauge anchors).
+    for (const frame_t frame_id : frame_ids) {
+      if (options.constant_frames.count(frame_id)) {
+        ba_config.SetConstantRigFromWorldPose(frame_id);
+      }
+    }
+
     // Fix rig poses, if not all frames within the local bundle.
     std::unordered_map<rig_t, size_t> num_frames_per_rig;
     num_frames_per_rig.reserve(frame_ids.size());
@@ -1098,6 +1105,13 @@ bool IncrementalMapper::AdjustGlobalBundle(
       if (existing_frame_ids_.count(frame_id)) {
         ba_config.SetConstantRigFromWorldPose(frame_id);
       }
+    }
+  }
+
+  // Fix explicitly constant frames (e.g. gauge anchors).
+  for (const frame_t frame_id : reconstruction_->RegFrameIds()) {
+    if (options.constant_frames.count(frame_id)) {
+      ba_config.SetConstantRigFromWorldPose(frame_id);
     }
   }
 

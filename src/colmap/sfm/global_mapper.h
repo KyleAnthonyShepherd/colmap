@@ -293,10 +293,14 @@ class GlobalMapper {
   // output stays in the prior coordinate frame.
   //
   // Must be called AFTER LoadPriorPoses() and BootstrapNewImagePoses();
-  // `new_image_ids` is the return value of the latter.
-  bool SolveIncrementalWindowed(const GlobalMapperOptions& options,
-                                const class Reconstruction& prior_reconstruction,
-                                const std::unordered_set<image_t>& new_image_ids);
+  // `new_image_ids` is the return value of the latter. Images listed in
+  // `constant_image_ids` (e.g. gauge anchors) keep their poses constant
+  // even when they fall inside the covisibility window.
+  bool SolveIncrementalWindowed(
+      const GlobalMapperOptions& options,
+      const class Reconstruction& prior_reconstruction,
+      const std::unordered_set<image_t>& new_image_ids,
+      const std::unordered_set<image_t>& constant_image_ids = {});
   // ──────────────────────────────────────────────────────────────────────
 
   // Getter functions.

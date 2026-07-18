@@ -927,7 +927,8 @@ std::unordered_set<image_t> GlobalMapper::BootstrapNewImagePoses(
 bool GlobalMapper::SolveIncrementalWindowed(
     const GlobalMapperOptions& options,
     const class Reconstruction& prior_reconstruction,
-    const std::unordered_set<image_t>& new_image_ids) {
+    const std::unordered_set<image_t>& new_image_ids,
+    const std::unordered_set<image_t>& constant_image_ids) {
   THROW_CHECK_NOTNULL(reconstruction_);
   THROW_CHECK_GT(options.optimize_window_size, 0);
   THROW_CHECK(!new_image_ids.empty());
@@ -974,6 +975,12 @@ bool GlobalMapper::SolveIncrementalWindowed(
   mapper_options.ba_local_num_images = opts.optimize_window_size;
   mapper_options.num_threads = opts.num_threads;
   mapper_options.random_seed = opts.random_seed;
+  for (const image_t image_id : constant_image_ids) {
+    if (reconstruction_->ExistsImage(image_id)) {
+      mapper_options.constant_frames.insert(
+          reconstruction_->Image(image_id).FrameId());
+    }
+  }
 
   BundleAdjustmentOptions ba_options = opts.bundle_adjustment;
   ba_options.print_summary = false;

@@ -131,6 +131,22 @@ struct GlobalMapperOptions {
   // outlier test than distance-from-mean when only 2-3 candidates exist.
   // Set <= 0 to disable.
   double bootstrap_max_gravity_error_deg = 15.0;
+
+  // When > 0, incremental adds run a windowed local solve instead of the
+  // full global pipeline: prior 3D points are imported, only the new
+  // image(s) are triangulated, and bundle adjustment optimizes just the new
+  // image(s) plus the `optimize_window_size` most covisible registered
+  // images. All other poses stay constant, so per-add cost is ~O(window)
+  // instead of O(N) and the output remains in the prior coordinate frame by
+  // construction (no Sim3 realignment needed). Typical values: 15-25.
+  // 0 (default) keeps the previous full-solve behavior.
+  int optimize_window_size = 0;
+
+  // When > 0 together with optimize_window_size, the pipeline still runs a
+  // full global solve every time the total number of registered images is a
+  // multiple of this value, as a periodic global refresh (e.g. 10). 0 means
+  // windowed solves only.
+  int full_solve_interval = 0;
   // ─────────────────────────────────────────────────────────────────────
 };
 
@@ -267,6 +283,20 @@ class GlobalMapper {
   const std::unordered_set<image_t>& PriorImageIds() const {
     return prior_image_ids_;
   }
+
+  // Windowed local solve for incremental adds (see
+  // GlobalMapperOptions::optimize_window_size). Imports the prior
+  // reconstruction's 3D points, triangulates the new image(s) against them,
+  // and runs iterative local bundle adjustment around each new image with a
+  // covisibility window of `options.optimize_window_size` images. Poses
+  // outside the window contribute constant-pose residuals only, so the
+  // output stays in the prior coordinate frame.
+  //
+  // Must be called AFTER LoadPriorPoses() and BootstrapNewImagePoses();
+  // `new_image_ids` is the return value of the latter.
+  bool SolveIncrementalWindowed(const GlobalMapperOptions& options,
+                                const class Reconstruction& prior_reconstruction,
+                                const std::unordered_set<image_t>& new_image_ids);
   // ──────────────────────────────────────────────────────────────────────
 
   // Getter functions.

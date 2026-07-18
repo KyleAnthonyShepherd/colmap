@@ -169,23 +169,45 @@ void IncrementalGlobalPipeline::Run() {
     LOG(INFO) << "  image_id=" << id;
   }
 
-  // 7. Solve the remaining stages (track establishment, global positioning,
-  //    bundle adjustment, retriangulation).
+  // 7. Solve. When optimize_window_size > 0 run a windowed local solve
+  //    (O(window) per add, output stays in the prior frame by
+  //    construction), except every full_solve_interval-th image where a
+  //    full global solve acts as a periodic refresh.
+  const bool windowed =
+      mapper_opts.optimize_window_size > 0 &&
+      !(mapper_opts.full_solve_interval > 0 &&
+        reconstruction->NumRegImages() % mapper_opts.full_solve_interval == 0);
+
   Timer run_timer;
   run_timer.Start();
-  mapper.Solve(mapper_opts);
+  if (windowed) {
+    LOG(INFO) << "Running windowed incremental solve (window size "
+              << mapper_opts.optimize_window_size << ").";
+    if (!mapper.SolveIncrementalWindowed(
+            mapper_opts, prior_reconstruction, bootstrapped)) {
+      LOG(ERROR) << "Windowed incremental solve failed.";
+      return;
+    }
+  } else {
+    mapper.Solve(mapper_opts);
+  }
   LOG(INFO) << "Incremental global solve done in "
             << run_timer.ElapsedSeconds() << " s";
 
   // 8. Rig-scale alignment (matches standard GlobalPipeline behaviour).
-  AlignReconstructionToOrigRigScales(database_cache_->Rigs(),
-                                     reconstruction.get());
+  //    Skipped for windowed solves, which keep the prior scales.
+  if (!windowed) {
+    AlignReconstructionToOrigRigScales(database_cache_->Rigs(),
+                                       reconstruction.get());
+  }
 
   // 9. Optional: re-align the full output to the prior coordinate frame.
   //    Global positioning may have drifted the prior cameras slightly.
   //    We compute a Sim3 from (output prior centres) → (original prior
   //    centres) and apply it to the whole reconstruction.
-  if (mapper_opts.realign_to_prior_after_solve &&
+  //    Windowed solves never leave the prior frame, so realignment is
+  //    unnecessary there.
+  if (!windowed && mapper_opts.realign_to_prior_after_solve &&
       prior_reg_ids.size() >= 3) {
     // Collect the output positions of the prior images.
     std::vector<Eigen::Vector3d> new_prior_centres;

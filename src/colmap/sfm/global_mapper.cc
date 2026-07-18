@@ -922,4 +922,87 @@ std::unordered_set<image_t> GlobalMapper::BootstrapNewImagePoses(
   return bootstrapped;
 }
 
+// ── GlobalMapper::SolveIncrementalWindowed ─────────────────────────────────
+
+bool GlobalMapper::SolveIncrementalWindowed(
+    const GlobalMapperOptions& options,
+    const class Reconstruction& prior_reconstruction,
+    const std::unordered_set<image_t>& new_image_ids) {
+  THROW_CHECK_NOTNULL(reconstruction_);
+  THROW_CHECK_GT(options.optimize_window_size, 0);
+  THROW_CHECK(!new_image_ids.empty());
+
+  const GlobalMapperOptions opts = InitializeOptions(options);
+
+  // 1. Import the prior 3D points, re-linking their 2D-3D associations.
+  //    Track elements referencing images or keypoints missing from the
+  //    database cache are dropped (with the same corruption caveat as
+  //    LoadPriorPoses); tracks shorter than 2 views afterwards are skipped.
+  size_t num_imported = 0;
+  size_t num_skipped = 0;
+  for (const auto& [point3D_id, prior_point3D] :
+       prior_reconstruction.Points3D()) {
+    struct Point3D point3D;
+    point3D.xyz = prior_point3D.xyz;
+    point3D.color = prior_point3D.color;
+    point3D.error = prior_point3D.error;
+    for (const TrackElement& track_el : prior_point3D.track.Elements()) {
+      if (!reconstruction_->ExistsImage(track_el.image_id)) continue;
+      const Image& image = reconstruction_->Image(track_el.image_id);
+      if (track_el.point2D_idx >= image.NumPoints2D()) continue;
+      if (image.Point2D(track_el.point2D_idx).HasPoint3D()) continue;
+      point3D.track.AddElement(track_el);
+    }
+    if (point3D.track.Length() < 2) {
+      ++num_skipped;
+      continue;
+    }
+    reconstruction_->AddPoint3D(point3D_id, std::move(point3D));
+    ++num_imported;
+  }
+  LOG(INFO) << "SolveIncrementalWindowed: imported " << num_imported
+            << " prior 3D point(s), skipped " << num_skipped << ".";
+
+  // 2. Triangulate the new image(s) against the prior structure and run
+  //    iterative local bundle adjustment with a covisibility window. Poses
+  //    outside the window enter the problem as constant-pose residuals
+  //    only, so the prior frame is preserved by construction.
+  IncrementalMapper mapper(database_cache_);
+  mapper.BeginReconstruction(reconstruction_);
+
+  IncrementalMapper::Options mapper_options;
+  mapper_options.ba_local_num_images = opts.optimize_window_size;
+  mapper_options.num_threads = opts.num_threads;
+  mapper_options.random_seed = opts.random_seed;
+
+  BundleAdjustmentOptions ba_options = opts.bundle_adjustment;
+  ba_options.print_summary = false;
+  if (ba_options.ceres) {
+    ba_options.ceres->solver_options.num_threads = opts.num_threads;
+  }
+
+  IncrementalTriangulator::Options tri_options = opts.retriangulation;
+
+  size_t num_triangulated = 0;
+  for (const image_t image_id : new_image_ids) {
+    THROW_CHECK(reconstruction_->Image(image_id).HasPose())
+        << "New image " << image_id << " must be bootstrapped before the "
+        << "windowed solve.";
+    num_triangulated += mapper.TriangulateImage(tri_options, image_id);
+    mapper.IterativeLocalRefinement(/*max_num_refinements=*/2,
+                                    /*max_refinement_change=*/0.001,
+                                    mapper_options,
+                                    ba_options,
+                                    tri_options,
+                                    image_id);
+  }
+  mapper.EndReconstruction(/*discard=*/false);
+
+  LOG(INFO) << "SolveIncrementalWindowed: triangulated " << num_triangulated
+            << " observation(s) for " << new_image_ids.size()
+            << " new image(s); window size " << opts.optimize_window_size
+            << ".";
+  return true;
+}
+
 }  // namespace colmap

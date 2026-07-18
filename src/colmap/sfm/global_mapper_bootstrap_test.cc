@@ -424,6 +424,143 @@ TEST(BootstrapNewImagePoses, MinInliersTooHighBootstrapsNothing) {
   EXPECT_FALSE(reconstruction->Image(held_out).HasPose());
 }
 
+// ── SolveIncrementalWindowed ───────────────────────────────────────────────
+
+TEST(SolveIncrementalWindowed, AddOneImage) {
+  SetPRNGSeed(1);
+  const auto database_path = CreateTestDir() / "database_windowed.db";
+
+  auto database = Database::Open(database_path);
+  Reconstruction gt_reconstruction;
+  SyntheticDatasetOptions synthetic_dataset_options;
+  synthetic_dataset_options.num_rigs = 1;
+  synthetic_dataset_options.num_cameras_per_rig = 1;
+  synthetic_dataset_options.num_frames_per_rig = 7;
+  synthetic_dataset_options.num_points3D = 100;
+  synthetic_dataset_options.two_view_geometry_has_relative_pose = true;
+  SynthesizeDataset(
+      synthetic_dataset_options, &gt_reconstruction, database.get());
+
+  std::vector<image_t> reg_ids = gt_reconstruction.RegImageIds();
+  std::sort(reg_ids.begin(), reg_ids.end());
+  const image_t held_out = reg_ids.back();
+
+  Reconstruction prior = gt_reconstruction;
+  prior.DeRegisterFrame(prior.Image(held_out).FrameId());
+
+  auto reconstruction = std::make_shared<Reconstruction>();
+  GlobalMapper mapper(CreateDatabaseCache(*database));
+  mapper.BeginReconstruction(reconstruction);
+  mapper.LoadPriorPoses(prior);
+
+  GlobalMapperOptions options;
+  options.random_seed = 1;
+  options.optimize_window_size = 4;
+  const std::unordered_set<image_t> bootstrapped =
+      mapper.BootstrapNewImagePoses(options);
+  ASSERT_EQ(bootstrapped.count(held_out), 1);
+
+  ASSERT_TRUE(
+      mapper.SolveIncrementalWindowed(options, prior, bootstrapped));
+
+  // The new image's pose is refined near ground truth and the output stays
+  // in the prior (= ground-truth) frame without any realignment.
+  const Rigid3d& recovered = reconstruction->Image(held_out).CamFromWorld();
+  const Rigid3d& gt_pose = gt_reconstruction.Image(held_out).CamFromWorld();
+  EXPECT_LT(RotationErrorDeg(recovered, gt_pose), 1e-1);
+  EXPECT_LT((Center(recovered) - Center(gt_pose)).norm(), 1e-2);
+
+  // Prior structure was imported and the new image observes 3D points.
+  EXPECT_GT(reconstruction->NumPoints3D(), 50);
+  EXPECT_GT(reconstruction->Image(held_out).NumPoints3D(), 10);
+
+  // Prior poses stayed in the prior frame.
+  for (const image_t id : mapper.PriorImageIds()) {
+    EXPECT_LT((Center(reconstruction->Image(id).CamFromWorld()) -
+               Center(gt_reconstruction.Image(id).CamFromWorld()))
+                  .norm(),
+              1e-2);
+  }
+}
+
+// Drip-feeds images one at a time through the windowed path, mirroring the
+// production server loop (each add starts from the previous output).
+TEST(SolveIncrementalWindowed, DripFeedStaysNearGroundTruth) {
+  SetPRNGSeed(1);
+  const auto database_path = CreateTestDir() / "database_dripfeed.db";
+
+  auto database = Database::Open(database_path);
+  Reconstruction gt_reconstruction;
+  SyntheticDatasetOptions synthetic_dataset_options;
+  synthetic_dataset_options.num_rigs = 1;
+  synthetic_dataset_options.num_cameras_per_rig = 1;
+  synthetic_dataset_options.num_frames_per_rig = 12;
+  synthetic_dataset_options.num_points3D = 200;
+  synthetic_dataset_options.two_view_geometry_has_relative_pose = true;
+  SynthesizeDataset(
+      synthetic_dataset_options, &gt_reconstruction, database.get());
+
+  std::vector<image_t> reg_ids = gt_reconstruction.RegImageIds();
+  std::sort(reg_ids.begin(), reg_ids.end());
+
+  // Start from a prior containing the first 5 images.
+  Reconstruction prior = gt_reconstruction;
+  for (size_t i = 5; i < reg_ids.size(); ++i) {
+    prior.DeRegisterFrame(prior.Image(reg_ids[i]).FrameId());
+  }
+
+  GlobalMapperOptions options;
+  options.random_seed = 1;
+  options.optimize_window_size = 4;
+
+  for (size_t i = 5; i < reg_ids.size(); ++i) {
+    const image_t new_id = reg_ids[i];
+
+    // Restrict the database cache to the images "uploaded" so far, as in
+    // production where the database grows by one image per solve. This
+    // leaves exactly one unregistered image: the new one.
+    DatabaseCache::Options cache_options;
+    std::vector<std::string> visible_names;
+    for (size_t j = 0; j <= i; ++j) {
+      visible_names.push_back(gt_reconstruction.Image(reg_ids[j]).Name());
+    }
+    cache_options.image_names = {visible_names.begin(), visible_names.end()};
+    const auto database_cache =
+        DatabaseCache::Create(*database, cache_options);
+
+    auto reconstruction = std::make_shared<Reconstruction>();
+    GlobalMapper mapper(database_cache);
+    mapper.BeginReconstruction(reconstruction);
+    mapper.LoadPriorPoses(prior);
+
+    const std::unordered_set<image_t> bootstrapped =
+        mapper.BootstrapNewImagePoses(options);
+    ASSERT_EQ(bootstrapped.size(), 1) << "at step " << i;
+    ASSERT_EQ(bootstrapped.count(new_id), 1)
+        << "image " << new_id << " not bootstrapped at step " << i;
+
+    ASSERT_TRUE(
+        mapper.SolveIncrementalWindowed(options, prior, bootstrapped));
+
+    prior = *reconstruction;
+  }
+
+  // After drip-feeding all remaining images, every pose must be near ground
+  // truth in the ground-truth frame (no realignment applied anywhere).
+  for (const image_t id : reg_ids) {
+    ASSERT_TRUE(prior.Image(id).HasPose());
+    EXPECT_LT(RotationErrorDeg(prior.Image(id).CamFromWorld(),
+                               gt_reconstruction.Image(id).CamFromWorld()),
+              0.5)
+        << "image " << id;
+    EXPECT_LT((Center(prior.Image(id).CamFromWorld()) -
+               Center(gt_reconstruction.Image(id).CamFromWorld()))
+                  .norm(),
+              0.05)
+        << "image " << id;
+  }
+}
+
 // ── Sim3 realignment building block ────────────────────────────────────────
 
 TEST(Sim3Realignment, RecoversKnownTransform) {

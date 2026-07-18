@@ -93,6 +93,56 @@ TEST(IncrementalGlobalPipeline, AddOneImageToPrior) {
                                  /*max_proj_center_error=*/1e-2));
 }
 
+// Windowed mode: same add-one-image flow, but through the O(window) local
+// solve. The output must stay in the prior frame without realignment.
+TEST(IncrementalGlobalPipeline, AddOneImageWindowed) {
+  SetPRNGSeed(1);
+  const auto test_dir = CreateTestDir();
+  const auto database_path = test_dir / "database.db";
+  const auto prior_path = test_dir / "prior";
+  std::filesystem::create_directories(prior_path);
+
+  auto database = Database::Open(database_path);
+  Reconstruction gt_reconstruction;
+  SyntheticDatasetOptions synthetic_dataset_options;
+  synthetic_dataset_options.num_rigs = 1;
+  synthetic_dataset_options.num_cameras_per_rig = 1;
+  synthetic_dataset_options.num_frames_per_rig = 7;
+  synthetic_dataset_options.num_points3D = 100;
+  synthetic_dataset_options.two_view_geometry_has_relative_pose = true;
+  SynthesizeDataset(
+      synthetic_dataset_options, &gt_reconstruction, database.get());
+
+  std::vector<image_t> reg_ids = gt_reconstruction.RegImageIds();
+  std::sort(reg_ids.begin(), reg_ids.end());
+  const image_t held_out = reg_ids.back();
+
+  Reconstruction prior = gt_reconstruction;
+  prior.DeRegisterFrame(prior.Image(held_out).FrameId());
+  prior.Write(prior_path);
+
+  IncrementalGlobalPipelineOptions options;
+  options.prior_reconstruction_path = prior_path;
+  options.mapper.random_seed = 1;
+  options.mapper.optimize_window_size = 4;
+
+  auto reconstruction_manager = std::make_shared<ReconstructionManager>();
+  IncrementalGlobalPipeline pipeline(
+      std::move(options), database, reconstruction_manager);
+  pipeline.Run();
+
+  ASSERT_EQ(reconstruction_manager->Size(), 1);
+  const Reconstruction& output = *reconstruction_manager->Get(0);
+  ASSERT_TRUE(output.ExistsImage(held_out));
+  EXPECT_TRUE(output.Image(held_out).HasPose());
+  EXPECT_GT(output.NumPoints3D(), 50);
+
+  EXPECT_THAT(gt_reconstruction,
+              ReconstructionNear(output,
+                                 /*max_rotation_error_deg=*/1e-1,
+                                 /*max_proj_center_error=*/1e-2));
+}
+
 // Without a prior path the pipeline must behave like a standard global
 // reconstruction run.
 TEST(IncrementalGlobalPipeline, FallsBackToGlobalWithoutPrior) {

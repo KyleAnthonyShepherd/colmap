@@ -448,6 +448,16 @@ int RunIncrementalGlobalMapper(int argc, char** argv) {
       &options.global_mapper->mapper.bootstrap_max_gravity_error_deg,
       "Max angle (deg) between measured and candidate-implied gravity "
       "before a bootstrap candidate is rejected; <= 0 disables.");
+  options.AddDefaultOption(
+      "optimize_window_size",
+      &options.global_mapper->mapper.optimize_window_size,
+      "When > 0, run a windowed local solve around the new image(s) with "
+      "this many covisible images instead of a full global solve.");
+  options.AddDefaultOption(
+      "full_solve_interval",
+      &options.global_mapper->mapper.full_solve_interval,
+      "With optimize_window_size > 0: run a full global solve every time "
+      "the registered image count is a multiple of this value; 0 = never.");
 
   if (!options.Parse(argc, argv)) {
     return EXIT_FAILURE;

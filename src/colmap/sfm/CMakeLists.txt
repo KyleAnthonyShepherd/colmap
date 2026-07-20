@@ -38,6 +38,7 @@ COLMAP_ADD_LIBRARY(
         incremental_mapper.h incremental_mapper.cc
         incremental_triangulator.h incremental_triangulator.cc
         observation_manager.h observation_manager.cc
+        rotation_utils.h
     PUBLIC_LINK_LIBS
         colmap_scene
         colmap_estimators
@@ -54,6 +55,16 @@ endif()
 COLMAP_ADD_TEST(
     NAME global_mapper_test
     SRCS global_mapper_test.cc
+    LINK_LIBS colmap_sfm
+)
+COLMAP_ADD_TEST(
+    NAME global_mapper_bootstrap_test
+    SRCS global_mapper_bootstrap_test.cc
+    LINK_LIBS colmap_sfm
+)
+COLMAP_ADD_TEST(
+    NAME rotation_utils_test
+    SRCS rotation_utils_test.cc
     LINK_LIBS colmap_sfm
 )
 COLMAP_ADD_TEST(

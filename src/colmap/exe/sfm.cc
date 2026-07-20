@@ -443,6 +443,21 @@ int RunIncrementalGlobalMapper(int argc, char** argv) {
       "realign_to_prior",
       &options.global_mapper->mapper.realign_to_prior_after_solve,
       "Re-align output to the prior coordinate frame via Sim3 after solve.");
+  options.AddDefaultOption(
+      "bootstrap_max_gravity_error_deg",
+      &options.global_mapper->mapper.bootstrap_max_gravity_error_deg,
+      "Max angle (deg) between measured and candidate-implied gravity "
+      "before a bootstrap candidate is rejected; <= 0 disables.");
+  options.AddDefaultOption(
+      "optimize_window_size",
+      &options.global_mapper->mapper.optimize_window_size,
+      "When > 0, run a windowed local solve around the new image(s) with "
+      "this many covisible images instead of a full global solve.");
+  options.AddDefaultOption(
+      "full_solve_interval",
+      &options.global_mapper->mapper.full_solve_interval,
+      "With optimize_window_size > 0: run a full global solve every time "
+      "the registered image count is a multiple of this value; 0 = never.");
 
   if (!options.Parse(argc, argv)) {
     return EXIT_FAILURE;
@@ -484,6 +499,16 @@ int RunIncrementalGlobalMapper(int argc, char** argv) {
 
   reconstruction_manager->Write(output_path);
   options.Write(output_path / "project.ini");
+
+  // Persist the gauge anchors next to the reconstruction files so they
+  // survive the caller's promotion of the output directory and act as the
+  // fixed realignment reference for all subsequent incremental adds.
+  if (!pipeline.Anchors().Empty()) {
+    const std::filesystem::path numbered_dir = output_path / "0";
+    WriteAnchors((ExistsDir(numbered_dir) ? numbered_dir : output_path) /
+                     "anchors.txt",
+                 pipeline.Anchors());
+  }
 
   return EXIT_SUCCESS;
 }

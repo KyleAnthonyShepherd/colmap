@@ -11,6 +11,7 @@
 #include "colmap/sfm/rotation_utils.h"
 
 #include <algorithm>
+#include <type_traits>
 
 namespace colmap {
 namespace {
@@ -54,22 +55,6 @@ GlobalMapperOptions InitializeOptions(const GlobalMapperOptions& options) {
   }
   return opts;
 }
-
-// All evidence gathered from PoseGraph edges connecting one unregistered
-// image to one or more already-registered (prior) images.
-struct NewImageEvidence {
-  // Rotation candidates, one per valid prior-neighbour edge.
-  std::vector<Eigen::Quaterniond> rot_candidates;
-  std::vector<double>             rot_weights;   // inlier counts
-
-  // Ray bundle for the translation LS solve.
-  // ray_origins[i]    = world centre of prior camera i  (C_prior)
-  // ray_directions[i] = world-space unit vector from C_prior toward C_new
-  // ray_weights[i]    = inlier count (same edge as the rotation candidate)
-  std::vector<Eigen::Vector3d> ray_origins;
-  std::vector<Eigen::Vector3d> ray_directions;
-  std::vector<double>          ray_weights;
-};
 
 }  // namespace
 
@@ -558,9 +543,41 @@ void GlobalMapper::LoadPriorPoses(const class Reconstruction& prior_reconstructi
   prior_image_ids_.clear();
   size_t loaded = 0;
 
+  // Import the prior's refined camera intrinsics. The database may only
+  // hold coarse initial values (e.g. a focal prior from the field of view);
+  // the prior reconstruction's intrinsics were bundle-adjusted and are
+  // consistent with the prior poses and 3D points imported below. Without
+  // this, the windowed solve optimizes refined geometry against unrefined
+  // intrinsics and warps the model.
+  size_t loaded_cameras = 0;
+  for (const auto& [camera_id, prior_camera] : prior_reconstruction.Cameras()) {
+    if (!reconstruction_->ExistsCamera(camera_id)) continue;
+    struct Camera& camera = reconstruction_->Camera(camera_id);
+    if (camera.model_id != prior_camera.model_id ||
+        camera.width != prior_camera.width ||
+        camera.height != prior_camera.height) {
+      LOG(WARNING) << "LoadPriorPoses: camera " << camera_id
+                   << " differs in model/size between prior and database; "
+                      "keeping database intrinsics.";
+      continue;
+    }
+    camera.params = prior_camera.params;
+    camera.has_prior_focal_length = true;
+    ++loaded_cameras;
+  }
+
   for (const auto& [image_id, prior_image] : prior_reconstruction.Images()) {
     if (!prior_image.HasPose()) continue;
-    if (!reconstruction_->ExistsImage(image_id)) continue;
+    if (!reconstruction_->ExistsImage(image_id)) {
+      // A registered prior image that is missing from the database cache
+      // points at upstream database corruption (e.g. an image-deletion bug
+      // in the producing service) — do not hide it.
+      LOG(WARNING) << "LoadPriorPoses: prior image id " << image_id << " ('"
+                   << prior_image.Name()
+                   << "') is registered in the prior reconstruction but "
+                      "missing from the database cache; skipping it.";
+      continue;
+    }
 
     Image& image = reconstruction_->Image(image_id);
     image.FramePtr()->SetCamFromWorld(image.CameraId(), prior_image.CamFromWorld());
@@ -569,8 +586,232 @@ void GlobalMapper::LoadPriorPoses(const class Reconstruction& prior_reconstructi
     ++loaded;
   }
 
+  // Keep a sample of prior 3D points for the post-bootstrap cheirality check.
+  prior_points_sample_.clear();
+  constexpr size_t kMaxSamplePoints = 1000;
+  const size_t num_points = prior_reconstruction.NumPoints3D();
+  const size_t stride = std::max<size_t>(1, num_points / kMaxSamplePoints);
+  size_t point_idx = 0;
+  for (const auto& [point3D_id, point3D] : prior_reconstruction.Points3D()) {
+    if (point_idx++ % stride == 0) {
+      prior_points_sample_.push_back(point3D.xyz);
+    }
+  }
+
   LOG(INFO) << "LoadPriorPoses: seeded " << loaded
-            << " image(s) from prior reconstruction.";
+            << " image(s) and imported intrinsics for " << loaded_cameras
+            << " camera(s) from prior reconstruction.";
+}
+
+// ── SolvePoseFromPriorEdges ──────────────────────────────────────────────────────
+
+std::optional<Rigid3d> SolvePoseFromPriorEdges(
+    const std::vector<BootstrapEdgeObservation>& all_observations,
+    const double max_candidate_deg,
+    const std::optional<BootstrapGravityGate>& gravity_gate) {
+  if (all_observations.empty()) return std::nullopt;
+
+  // ── Pass 0: gravity gate ──────────────────────────────────────────────
+  //
+  // A rotation candidate implies a camera-frame gravity direction
+  // R_candidate * g_world. Candidates that disagree with the measured
+  // gravity beyond the threshold are outliers regardless of their weight —
+  // discard the whole observation (its translation ray depends on the same
+  // bad relative pose).
+  std::vector<BootstrapEdgeObservation> gated_observations;
+  const std::vector<BootstrapEdgeObservation>* observations_ptr =
+      &all_observations;
+  if (gravity_gate.has_value()) {
+    const Eigen::Vector3d g_meas =
+        gravity_gate->gravity_in_new_cam.normalized();
+    const Eigen::Vector3d g_world = gravity_gate->gravity_in_world.normalized();
+    const double max_dot_angle_rad =
+        gravity_gate->max_error_deg * M_PI / 180.0;
+
+    for (const BootstrapEdgeObservation& obs : all_observations) {
+      const Eigen::Quaterniond R_prior = obs.prior_cam_from_world.rotation();
+      const Eigen::Quaterniond R_rel = obs.cam2_from_cam1.rotation();
+      const Eigen::Quaterniond R_new_cand =
+          obs.prior_is_cam1 ? (R_rel * R_prior).normalized()
+                            : (R_rel.inverse() * R_prior).normalized();
+      const Eigen::Vector3d g_implied = R_new_cand * g_world;
+      const double angle = std::acos(
+          std::clamp(g_implied.dot(g_meas), -1.0, 1.0));
+      if (angle <= max_dot_angle_rad) {
+        gated_observations.push_back(obs);
+      }
+    }
+
+    if (gated_observations.empty()) {
+      LOG(WARNING)
+          << "SolvePoseFromPriorEdges: all " << all_observations.size()
+          << " candidate(s) violate the gravity prior by more than "
+          << gravity_gate->max_error_deg
+          << " deg; proceeding without the gravity gate (measured gravity "
+             "may be unreliable).";
+    } else {
+      if (gated_observations.size() < all_observations.size()) {
+        LOG(INFO) << "SolvePoseFromPriorEdges: gravity gate discarded "
+                  << all_observations.size() - gated_observations.size()
+                  << " of " << all_observations.size() << " candidate(s).";
+      }
+      observations_ptr = &gated_observations;
+    }
+  }
+  const std::vector<BootstrapEdgeObservation>& observations =
+      *observations_ptr;
+
+  // Rigid3d convention:
+  //   p_cam2 = R_rel * p_cam1 + t_rel
+  //   R_rel  = R_cam2 * R_cam1^{-1}
+  //   t_rel  = position of cam1's world-origin in cam2's frame
+  //            (unit-norm from essential-matrix decomposition; direction ok)
+
+  // ── Pass 1: rotation candidates + translation ray bundle ─────────────
+
+  std::vector<Eigen::Quaterniond> rot_candidates;
+  std::vector<double> rot_weights;
+  rot_candidates.reserve(observations.size());
+  rot_weights.reserve(observations.size());
+
+  // Rays are stored as (origin, t_rel_unit, prior_is_cam1, R_prior); the
+  // world-space direction is derived in Pass 2 from the final mean rotation.
+  struct Ray {
+    Eigen::Vector3d origin;      // C_prior in world space
+    Eigen::Vector3d t_rel_unit;  // normalized edge translation
+    bool prior_is_cam1;
+    Eigen::Matrix3d R_prior;     // rotation of prior_cam_from_world
+    double weight;
+  };
+  std::vector<Ray> rays;
+  rays.reserve(observations.size());
+
+  for (const BootstrapEdgeObservation& obs : observations) {
+    const Eigen::Quaterniond R_prior = obs.prior_cam_from_world.rotation();
+
+    // ── Rotation candidate ───────────────────────────────────────────────────
+    //
+    //   pair (prior=cam1, new=cam2):  R_rel = R_new * R_prior^{-1}
+    //                                 ⟹  R_new = R_rel * R_prior
+    //
+    //   pair (new=cam1, prior=cam2):  R_rel = R_prior * R_new^{-1}
+    //                                 ⟹  R_new = R_rel^{-1} * R_prior
+    const Eigen::Quaterniond R_rel = obs.cam2_from_cam1.rotation();
+    const Eigen::Quaterniond R_new_cand =
+        obs.prior_is_cam1 ? (R_rel * R_prior).normalized()
+                          : (R_rel.inverse() * R_prior).normalized();
+
+    rot_candidates.push_back(R_new_cand);
+    rot_weights.push_back(obs.weight);
+
+    // ── Ray for translation LS ─────────────────────────────────────────────
+    //
+    // A near-zero relative translation (pure-rotation edge) contributes no
+    // usable ray; the rotation candidate above is still kept.
+    const Eigen::Vector3d t_rel_raw = obs.cam2_from_cam1.translation();
+    const double t_norm = t_rel_raw.norm();
+    if (t_norm < 1e-9) continue;
+
+    Ray ray;
+    ray.origin = Inverse(obs.prior_cam_from_world).translation();
+    ray.t_rel_unit = t_rel_raw / t_norm;
+    ray.prior_is_cam1 = obs.prior_is_cam1;
+    ray.R_prior = R_prior.toRotationMatrix();
+    ray.weight = obs.weight;
+    rays.push_back(std::move(ray));
+  }
+
+  // ── Pass 2a: rotation via weighted Karcher mean on SO(3) ─────────────
+
+  const int best_idx = BestCandidateIdxByWeight(rot_weights);
+  Eigen::Quaterniond q_mean = KarcherMeanSO3(
+      rot_candidates, rot_weights, rot_candidates[best_idx]);
+
+  // Outlier pass: discard candidates more than max_candidate_deg from the
+  // current mean, then recompute the mean over the inliers.
+  if (rot_candidates.size() > 1) {
+    const double max_rad = max_candidate_deg * M_PI / 180.0;
+
+    std::vector<Eigen::Quaterniond> inlier_rots;
+    std::vector<double> inlier_rot_w;
+    for (size_t i = 0; i < rot_candidates.size(); ++i) {
+      Eigen::Quaterniond dq = (q_mean.inverse() * rot_candidates[i]).normalized();
+      if (dq.w() < 0.0) dq.coeffs() = -dq.coeffs();
+      const double angle = 2.0 * std::acos(std::clamp(std::abs(dq.w()), 0.0, 1.0));
+      if (angle <= max_rad) {
+        inlier_rots.push_back(rot_candidates[i]);
+        inlier_rot_w.push_back(rot_weights[i]);
+      }
+    }
+    if (!inlier_rots.empty() && inlier_rots.size() < rot_candidates.size()) {
+      const int bi = BestCandidateIdxByWeight(inlier_rot_w);
+      q_mean = KarcherMeanSO3(inlier_rots, inlier_rot_w, inlier_rots[bi]);
+    }
+  }
+
+  const Eigen::Matrix3d R_new_mat = q_mean.toRotationMatrix();
+  const Eigen::Matrix3d R_new_mat_T = R_new_mat.transpose();
+
+  // ── Pass 2b: translation via weighted multi-ray least squares ─────────
+  //
+  // World-space ray direction from C_prior toward C_new:
+  //
+  //   pair (prior=cam1, new=cam2):
+  //     t_rel = C_prior in new-cam frame.
+  //     direction prior→new  =  −R_new^T * t̂_rel
+  //     (uses the final mean rotation, so all rays are consistent with the
+  //      averaged pose rather than their per-edge candidates)
+  //
+  //   pair (new=cam1, prior=cam2):
+  //     t_rel = C_new in prior-cam frame.
+  //     direction prior→new  =  +R_prior^T * t̂_rel
+  //
+  // Each ray (o_i, d_i, w_i) contributes to:
+  //   A  +=  w_i * (I − d_i d_i^T)
+  //   b  +=  w_i * (I − d_i d_i^T) * o_i
+  //
+  // Solve A * C_new = b  for the world-space camera centre C_new.
+
+  Eigen::Matrix3d A = Eigen::Matrix3d::Zero();
+  Eigen::Vector3d b_vec = Eigen::Vector3d::Zero();
+
+  for (const Ray& ray : rays) {
+    Eigen::Vector3d d = ray.prior_is_cam1
+                            ? Eigen::Vector3d(-(R_new_mat_T * ray.t_rel_unit))
+                            : Eigen::Vector3d(ray.R_prior.transpose() *
+                                              ray.t_rel_unit);
+    d.normalize();
+
+    const Eigen::Matrix3d P = Eigen::Matrix3d::Identity() - d * d.transpose();
+    A += ray.weight * P;
+    b_vec += ray.weight * P * ray.origin;
+  }
+
+  Eigen::Vector3d C_new;
+  if (rays.empty() || std::abs(A.determinant()) < 1e-9) {
+    // Near-singular: rays are nearly parallel (e.g. a single ray, or all
+    // priors colinear with the new camera) or no usable rays at all.  Fall
+    // back to the weighted centroid of the prior centres.  Global
+    // positioning will correct this.
+    LOG(WARNING) << "SolvePoseFromPriorEdges: near-singular ray system; "
+                    "using prior-centre centroid as translation fallback.";
+    C_new = Eigen::Vector3d::Zero();
+    double w_sum = 0.0;
+    for (const BootstrapEdgeObservation& obs : observations) {
+      C_new += obs.weight * Inverse(obs.prior_cam_from_world).translation();
+      w_sum += obs.weight;
+    }
+    C_new /= w_sum;
+  } else {
+    C_new = A.colPivHouseholderQr().solve(b_vec);
+  }
+
+  // Convert world centre to COLMAP's cam_from_world translation:
+  //   t = -R_new * C_new
+  Rigid3d pose;
+  pose.rotation() = q_mean;
+  pose.translation() = -(R_new_mat * C_new);
+  return pose;
 }
 
 // ── GlobalMapper::BootstrapNewImagePoses ────────────────────────────────────
@@ -582,23 +823,18 @@ std::unordered_set<image_t> GlobalMapper::BootstrapNewImagePoses(
   DCHECK(!prior_image_ids_.empty())
       << "Call LoadPriorPoses() before BootstrapNewImagePoses().";
 
-  // ── Pass 1: collect rotation candidates + rays from PoseGraph ───────────
-  //
-  // NOTE: If your PoseGraph exposes pairs via a public member rather than a
-  // getter, replace  pose_graph_->ImagePairs()  with  pose_graph_->image_pairs.
-  //
-  // RelativePoseData (inherits TwoViewGeometry) fields used:
-  //   .num_inliers          (int)
-  //   .cam2_from_cam1       (Rigid3d at c2a0c911; std::optional<Rigid3d>
-  //                          on 4.1.0.dev0+ — guard with .has_value() there)
-  //
-  // Rigid3d convention:
-  //   p_cam2 = R_rel * p_cam1 + t_rel
-  //   R_rel  = R_cam2 * R_cam1^{-1}
-  //   t_rel  = position of cam1's world-origin in cam2's frame
-  //            (unit-norm from essential-matrix decomposition; direction ok)
+  // Guard against the upstream signature drift where
+  // PoseGraph::Edge::cam2_from_cam1 becomes std::optional<Rigid3d>: fail
+  // loudly at compile time after a rebase instead of invoking UB.
+  static_assert(
+      std::is_same_v<decltype(PoseGraph::Edge::cam2_from_cam1), Rigid3d>,
+      "PoseGraph::Edge::cam2_from_cam1 is assumed to be a plain Rigid3d. "
+      "If it is std::optional<Rigid3d> on this base, guard the accesses "
+      "below with has_value().");
 
-  std::unordered_map<image_t, NewImageEvidence> evidence;
+  // Walk the PoseGraph and collect, for every unregistered image, all valid
+  // edges that connect it to a prior (registered) image.
+  std::unordered_map<image_t, std::vector<BootstrapEdgeObservation>> evidence;
 
   for (const auto& [pair_id, rel_pose] : pose_graph_->Edges()) {
     if (!rel_pose.valid) continue;
@@ -611,194 +847,93 @@ std::unordered_set<image_t> GlobalMapper::BootstrapNewImagePoses(
     if (id1_prior == id2_prior) continue;  // both or neither — skip
 
     const image_t prior_id = id1_prior ? id1 : id2;
-    const image_t new_id   = id1_prior ? id2 : id1;
+    const image_t new_id = id1_prior ? id2 : id1;
 
     if (!reconstruction_->ExistsImage(new_id)) continue;
     if (reconstruction_->Image(new_id).HasPose()) continue;
 
-    const Image& prior_img = reconstruction_->Image(prior_id);
-    const Eigen::Quaterniond R_prior = prior_img.CamFromWorld().rotation();
-    const Eigen::Matrix3d     R_prior_mat = R_prior.toRotationMatrix();
-
-    // ── Rotation candidate ───────────────────────────────────────────────
-    //
-    //   pair (prior=cam1, new=cam2):  R_rel = R_new * R_prior^{-1}
-    //                                 ⟹  R_new = R_rel * R_prior
-    //
-    //   pair (new=cam1, prior=cam2):  R_rel = R_prior * R_new^{-1}
-    //                                 ⟹  R_new = R_rel^{-1} * R_prior
-    const Eigen::Quaterniond R_rel = rel_pose.cam2_from_cam1.rotation();
-    const Eigen::Quaterniond R_new_cand =
-        id1_prior ? (R_rel * R_prior).normalized()
-                  : (R_rel.inverse() * R_prior).normalized();
-
-    auto& ev = evidence[new_id];
-    ev.rot_candidates.push_back(R_new_cand);
-    ev.rot_weights.push_back(static_cast<double>(rel_pose.num_matches));
-
-    // ── Ray for translation LS ───────────────────────────────────────────
-    //
-    // cam2_from_cam1.translation (t_rel) = cam1's world-origin in cam2's frame.
-    //
-    // We want:  d_world = unit vector from C_prior toward C_new (world space).
-    //
-    //   pair (prior=cam1, new=cam2):
-    //     t_rel = C_prior in new-cam frame.
-    //     C_prior − C_new  ∝  R_new^T * t_rel    (both in world)
-    //     direction prior→new  =  −R_new^T * t̂_rel
-    //
-    //   pair (new=cam1, prior=cam2):
-    //     t_rel = C_new in prior-cam frame.
-    //     C_new − C_prior  ∝  R_prior^T * t_rel
-    //     direction prior→new  =  +R_prior^T * t̂_rel
-    //
-    // We use R_new_cand for R_new here; the small error vs the final Karcher
-    // mean is corrected in Pass 2 below.
-    const Eigen::Vector3d t_rel_raw = rel_pose.cam2_from_cam1.translation();
-    const double t_norm = t_rel_raw.norm();
-    if (t_norm < 1e-9) continue;  // degenerate translation; skip this ray
-    const Eigen::Vector3d t_rel_unit = t_rel_raw / t_norm;
-
-    Eigen::Vector3d d_world;
-    if (id1_prior) {
-      // cam2 = new  →  t_rel is C_prior in new's frame
-      d_world = -(R_new_cand.toRotationMatrix().transpose() * t_rel_unit);
-    } else {
-      // cam2 = prior  →  t_rel is C_new in prior's frame
-      d_world = R_prior_mat.transpose() * t_rel_unit;
-    }
-    d_world.normalize();
-
-    ev.ray_origins.push_back(prior_img.ProjectionCenter());
-    ev.ray_directions.push_back(d_world);
-    ev.ray_weights.push_back(static_cast<double>(rel_pose.num_matches));
+    BootstrapEdgeObservation obs;
+    obs.cam2_from_cam1 = rel_pose.cam2_from_cam1;
+    obs.prior_is_cam1 = id1_prior;
+    obs.prior_cam_from_world = reconstruction_->Image(prior_id).CamFromWorld();
+    obs.weight = static_cast<double>(rel_pose.num_matches);
+    evidence[new_id].push_back(std::move(obs));
   }
 
-  // ── Pass 2: Karcher mean + multi-ray LS, write pose ─────────────────────
+  // Gravity gate setup: collect per-image gravity priors and derive the
+  // world gravity direction from the prior images' priors and poses.
+  std::unordered_map<image_t, Eigen::Vector3d> image_to_gravity;
+  std::optional<Eigen::Vector3d> world_gravity;
+  if (options.bootstrap_max_gravity_error_deg > 0) {
+    for (const PosePrior& pose_prior : database_cache_->PosePriors()) {
+      if (pose_prior.corr_data_id.sensor_id.type == SensorType::CAMERA &&
+          pose_prior.HasGravity()) {
+        image_to_gravity[pose_prior.corr_data_id.id] =
+            pose_prior.gravity.normalized();
+      }
+    }
 
+    Eigen::Vector3d world_gravity_sum = Eigen::Vector3d::Zero();
+    size_t num_prior_gravities = 0;
+    for (const image_t prior_id : prior_image_ids_) {
+      const auto it = image_to_gravity.find(prior_id);
+      if (it == image_to_gravity.end()) continue;
+      // g_world = R_cam_from_world^T * g_cam.
+      const Eigen::Quaterniond R_prior =
+          reconstruction_->Image(prior_id).CamFromWorld().rotation();
+      world_gravity_sum += R_prior.inverse() * it->second;
+      ++num_prior_gravities;
+    }
+    if (num_prior_gravities > 0 && world_gravity_sum.norm() > 1e-6) {
+      world_gravity = world_gravity_sum.normalized();
+    }
+  }
+
+  // Solve each new image's pose from its accumulated evidence.
   std::unordered_set<image_t> bootstrapped;
 
-  for (auto& [new_id, ev] : evidence) {
-    if (ev.rot_candidates.empty()) continue;
-
-    // ── Rotation: weighted Karcher mean on SO(3) ─────────────────────────
-
-    const int best_idx = BestCandidateIdxByWeight(ev.rot_weights);
-    Eigen::Quaterniond q_mean =
-        KarcherMeanSO3(ev.rot_candidates, ev.rot_weights,
-                       ev.rot_candidates[best_idx]);
-
-    // Outlier pass: discard candidates more than bootstrap_max_candidate_deg
-    // from the current mean, then recompute.
-    if (ev.rot_candidates.size() > 1) {
-      const double max_rad =
-          options.bootstrap_max_candidate_deg * M_PI / 180.0;
-
-      std::vector<Eigen::Quaterniond> inlier_rots;
-      std::vector<double>             inlier_rot_w;
-      for (size_t i = 0; i < ev.rot_candidates.size(); ++i) {
-        Eigen::Quaterniond dq =
-            (q_mean.inverse() * ev.rot_candidates[i]).normalized();
-        if (dq.w() < 0.0) dq.coeffs() = -dq.coeffs();
-        const double angle =
-            2.0 * std::acos(std::clamp(std::abs(dq.w()), 0.0, 1.0));
-        if (angle <= max_rad) {
-          inlier_rots.push_back(ev.rot_candidates[i]);
-          inlier_rot_w.push_back(ev.rot_weights[i]);
-        }
-      }
-      if (!inlier_rots.empty() &&
-          inlier_rots.size() < ev.rot_candidates.size()) {
-        const int bi = BestCandidateIdxByWeight(inlier_rot_w);
-        q_mean = KarcherMeanSO3(inlier_rots, inlier_rot_w, inlier_rots[bi]);
+  for (const auto& [new_id, observations] : evidence) {
+    std::optional<BootstrapGravityGate> gravity_gate;
+    if (world_gravity.has_value()) {
+      const auto it = image_to_gravity.find(new_id);
+      if (it != image_to_gravity.end()) {
+        BootstrapGravityGate gate;
+        gate.gravity_in_new_cam = it->second;
+        gate.gravity_in_world = *world_gravity;
+        gate.max_error_deg = options.bootstrap_max_gravity_error_deg;
+        gravity_gate = gate;
       }
     }
 
-    // ── Translation: weighted multi-ray least squares ────────────────────
-    //
-    // Each ray (o_i, d_i, w_i) contributes to:
-    //   A  +=  w_i * (I − d_i d_i^T)
-    //   b  +=  w_i * (I − d_i d_i^T) * o_i
-    //
-    // Solve A * C_new = b  for the world-space camera centre C_new.
-    //
-    // Before accumulating we re-derive the directions for prior→new pairs
-    // using the final q_mean instead of the per-edge R_new_cand.  This
-    // removes the small error that was introduced by using an unaveraged
-    // per-edge rotation estimate, and costs only one 3×3 matrix multiply
-    // per ray.
-    //
-    // For new→prior pairs the ray direction was computed using R_prior (exact),
-    // so no refinement is needed.  We detect which case applies by checking
-    // the sign agreement with the initial stored direction: if a re-derived
-    // direction flips sign something is wrong with the cheirality, and we
-    // keep the original stored direction.
-
-    const Eigen::Matrix3d R_new_mat = q_mean.toRotationMatrix();
-    const Eigen::Matrix3d R_new_mat_T = R_new_mat.transpose();
-
-    Eigen::Matrix3d A = Eigen::Matrix3d::Zero();
-    Eigen::Vector3d b_vec = Eigen::Vector3d::Zero();
-
-    for (size_t i = 0; i < ev.ray_origins.size(); ++i) {
-      const double w = ev.ray_weights[i];
-      Eigen::Vector3d d = ev.ray_directions[i];
-
-      // Try to re-derive the direction for prior→new edges using q_mean.
-      // We stored t_rel_unit implicitly in d:  d = -R_new_cand^T * t_rel_unit
-      // → t_rel_unit = -R_new_cand * d
-      // Refined: d_refined = -R_new_mat^T * t_rel_unit
-      //                    = -R_new_mat^T * (-R_new_cand * d_stored)
-      //                    = R_new_mat^T * R_new_cand * d_stored
-      // If R_new_cand ≈ q_mean this is just d_stored — no extra work needed.
-      // We skip the refinement step and instead just normalise d, since
-      // rotation_utils guarantees q_mean is close to every inlier candidate.
-      d.normalize();
-
-      const Eigen::Matrix3d P = Eigen::Matrix3d::Identity() - d * d.transpose();
-      A     += w * P;
-      b_vec += w * P * ev.ray_origins[i];
-    }
-
-    // Solve the 3×3 system.
-    Eigen::Vector3d C_new;
-    if (std::abs(A.determinant()) < 1e-9) {
-      // Near-singular: rays are nearly parallel (e.g. all priors colinear
-      // with the new camera).  Fall back to weighted centroid of ray origins.
-      // Global positioning will correct this.
-      LOG(WARNING) << "BootstrapNewImagePoses: near-singular ray system for "
-                      "image " << new_id << "; using ray-origin centroid as "
-                      "translation fallback.";
-      C_new = Eigen::Vector3d::Zero();
-      double w_sum = 0.0;
-      for (size_t i = 0; i < ev.ray_origins.size(); ++i) {
-        C_new += ev.ray_weights[i] * ev.ray_origins[i];
-        w_sum += ev.ray_weights[i];
-      }
-      C_new /= w_sum;
-    } else {
-      C_new = A.colPivHouseholderQr().solve(b_vec);
-    }
-
-    // Convert world centre to COLMAP's cam_from_world translation:
-    //   t = -R_new * C_new
-    const Eigen::Vector3d t_new = -(R_new_mat * C_new);
-
-    // ── Write full pose ──────────────────────────────────────────────────
+    const std::optional<Rigid3d> pose = SolvePoseFromPriorEdges(
+        observations, options.bootstrap_max_candidate_deg, gravity_gate);
+    if (!pose.has_value()) continue;
 
     Image& new_image = reconstruction_->Image(new_id);
-    Rigid3d pose;
-    pose.rotation()    = q_mean;
-    pose.translation() = t_new;
-    new_image.FramePtr()->SetCamFromWorld(new_image.CameraId(), pose);
+    new_image.FramePtr()->SetCamFromWorld(new_image.CameraId(), *pose);
     reconstruction_->RegisterFrame(new_image.FrameId());
-
     bootstrapped.insert(new_id);
 
-    LOG(INFO) << "BootstrapNewImagePoses: image " << new_id
-              << " — rotation from " << ev.rot_candidates.size()
-              << " candidate(s), translation from "
-              << ev.ray_origins.size() << " ray(s).";
+    LOG(INFO) << "BootstrapNewImagePoses: image " << new_id << " — pose from "
+              << observations.size() << " prior edge(s).";
+
+    // Cheap cheirality sanity check: a plausibly-posed camera should see a
+    // reasonable fraction of the prior scene points in front of it.  Warn
+    // only — Solve() may still fix a marginal pose.
+    if (!prior_points_sample_.empty()) {
+      size_t num_in_front = 0;
+      for (const Eigen::Vector3d& point : prior_points_sample_) {
+        if ((*pose * point).z() > 0) ++num_in_front;
+      }
+      const double frac =
+          static_cast<double>(num_in_front) / prior_points_sample_.size();
+      if (frac < 0.1) {
+        LOG(WARNING) << "BootstrapNewImagePoses: only "
+                     << 100.0 * frac << "% of sampled prior 3D points have "
+                     << "positive depth in bootstrapped image " << new_id
+                     << "; the pose may be unreliable.";
+      }
+    }
   }
 
   if (bootstrapped.empty()) {
@@ -809,6 +944,141 @@ std::unordered_set<image_t> GlobalMapper::BootstrapNewImagePoses(
   }
 
   return bootstrapped;
+}
+
+// ── GlobalMapper::SolveIncrementalWindowed ─────────────────────────────────
+
+bool GlobalMapper::SolveIncrementalWindowed(
+    const GlobalMapperOptions& options,
+    const class Reconstruction& prior_reconstruction,
+    const std::unordered_set<image_t>& new_image_ids,
+    const std::unordered_set<image_t>& constant_image_ids) {
+  THROW_CHECK_NOTNULL(reconstruction_);
+  THROW_CHECK_GT(options.optimize_window_size, 0);
+  THROW_CHECK(!new_image_ids.empty());
+
+  const GlobalMapperOptions opts = InitializeOptions(options);
+
+  // 0. Seed the new images' camera intrinsics from refined prior cameras of
+  //    identical model and size. The database typically only carries a
+  //    coarse focal prior (e.g. from the field of view); starting local
+  //    bundle adjustment 30-40% off in focal length biases the refined
+  //    poses and the error compounds across adds. With a same-device
+  //    capture loop the refined prior intrinsics are a far better initial
+  //    value. (LoadPriorPoses already imported the prior cameras' params
+  //    for the prior images themselves.)
+  for (const image_t new_id : new_image_ids) {
+    if (!reconstruction_->ExistsImage(new_id)) continue;
+    struct Camera& camera = *reconstruction_->Image(new_id).CameraPtr();
+    if (prior_reconstruction.ExistsCamera(camera.camera_id)) continue;
+    std::vector<double> focals;
+    const struct Camera* donor = nullptr;
+    for (const auto& [prior_camera_id, prior_camera] :
+         prior_reconstruction.Cameras()) {
+      if (prior_camera.model_id == camera.model_id &&
+          prior_camera.width == camera.width &&
+          prior_camera.height == camera.height) {
+        focals.push_back(prior_camera.MeanFocalLength());
+        donor = &prior_camera;
+      }
+    }
+    if (donor == nullptr) continue;
+    // Use the params of the prior camera with the median mean focal.
+    std::nth_element(
+        focals.begin(), focals.begin() + focals.size() / 2, focals.end());
+    const double median_focal = focals[focals.size() / 2];
+    for (const auto& [prior_camera_id, prior_camera] :
+         prior_reconstruction.Cameras()) {
+      if (prior_camera.model_id == camera.model_id &&
+          prior_camera.width == camera.width &&
+          prior_camera.height == camera.height &&
+          prior_camera.MeanFocalLength() == median_focal) {
+        donor = &prior_camera;
+        break;
+      }
+    }
+    camera.params = donor->params;
+    LOG(INFO) << "SolveIncrementalWindowed: seeded intrinsics of new camera "
+              << camera.camera_id << " from prior camera "
+              << donor->camera_id << " (focal "
+              << donor->MeanFocalLength() << ").";
+  }
+
+  // 1. Import the prior 3D points, re-linking their 2D-3D associations.
+  //    Track elements referencing images or keypoints missing from the
+  //    database cache are dropped (with the same corruption caveat as
+  //    LoadPriorPoses); tracks shorter than 2 views afterwards are skipped.
+  size_t num_imported = 0;
+  size_t num_skipped = 0;
+  for (const auto& [point3D_id, prior_point3D] :
+       prior_reconstruction.Points3D()) {
+    struct Point3D point3D;
+    point3D.xyz = prior_point3D.xyz;
+    point3D.color = prior_point3D.color;
+    point3D.error = prior_point3D.error;
+    for (const TrackElement& track_el : prior_point3D.track.Elements()) {
+      if (!reconstruction_->ExistsImage(track_el.image_id)) continue;
+      const Image& image = reconstruction_->Image(track_el.image_id);
+      if (track_el.point2D_idx >= image.NumPoints2D()) continue;
+      if (image.Point2D(track_el.point2D_idx).HasPoint3D()) continue;
+      point3D.track.AddElement(track_el);
+    }
+    if (point3D.track.Length() < 2) {
+      ++num_skipped;
+      continue;
+    }
+    reconstruction_->AddPoint3D(point3D_id, std::move(point3D));
+    ++num_imported;
+  }
+  LOG(INFO) << "SolveIncrementalWindowed: imported " << num_imported
+            << " prior 3D point(s), skipped " << num_skipped << ".";
+
+  // 2. Triangulate the new image(s) against the prior structure and run
+  //    iterative local bundle adjustment with a covisibility window. Poses
+  //    outside the window enter the problem as constant-pose residuals
+  //    only, so the prior frame is preserved by construction.
+  IncrementalMapper mapper(database_cache_);
+  mapper.BeginReconstruction(reconstruction_);
+
+  IncrementalMapper::Options mapper_options;
+  mapper_options.ba_local_num_images = opts.optimize_window_size;
+  mapper_options.num_threads = opts.num_threads;
+  mapper_options.random_seed = opts.random_seed;
+  for (const image_t image_id : constant_image_ids) {
+    if (reconstruction_->ExistsImage(image_id)) {
+      mapper_options.constant_frames.insert(
+          reconstruction_->Image(image_id).FrameId());
+    }
+  }
+
+  BundleAdjustmentOptions ba_options = opts.bundle_adjustment;
+  ba_options.print_summary = false;
+  if (ba_options.ceres) {
+    ba_options.ceres->solver_options.num_threads = opts.num_threads;
+  }
+
+  IncrementalTriangulator::Options tri_options = opts.retriangulation;
+
+  size_t num_triangulated = 0;
+  for (const image_t image_id : new_image_ids) {
+    THROW_CHECK(reconstruction_->Image(image_id).HasPose())
+        << "New image " << image_id << " must be bootstrapped before the "
+        << "windowed solve.";
+    num_triangulated += mapper.TriangulateImage(tri_options, image_id);
+    mapper.IterativeLocalRefinement(/*max_num_refinements=*/2,
+                                    /*max_refinement_change=*/0.001,
+                                    mapper_options,
+                                    ba_options,
+                                    tri_options,
+                                    image_id);
+  }
+  mapper.EndReconstruction(/*discard=*/false);
+
+  LOG(INFO) << "SolveIncrementalWindowed: triangulated " << num_triangulated
+            << " observation(s) for " << new_image_ids.size()
+            << " new image(s); window size " << opts.optimize_window_size
+            << ".";
+  return true;
 }
 
 }  // namespace colmap

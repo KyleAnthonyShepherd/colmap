@@ -10,7 +10,8 @@
 
 #include <filesystem>
 #include <limits>
-// ── INCREMENTAL-ADD (new include) ─────────────────────────────────────────
+// ── INCREMENTAL-ADD (new includes) ────────────────────────────────────────
+#include <optional>
 #include <unordered_set>
 // ─────────────────────────────────────────────────────────────────────────
 
@@ -122,8 +123,86 @@ struct GlobalMapperOptions {
   // the prior image centres.  Always recommended when skip_rotation_averaging
   // = true to correct any metric drift from global positioning.
   bool realign_to_prior_after_solve = true;
+
+  // Maximum disagreement (degrees) between the measured gravity direction of
+  // a new image (from its pose prior) and the gravity direction implied by a
+  // rotation candidate before the candidate is rejected. Requires gravity
+  // priors on both the new image and the prior images. This is a stronger
+  // outlier test than distance-from-mean when only 2-3 candidates exist.
+  // Set <= 0 to disable.
+  double bootstrap_max_gravity_error_deg = 15.0;
+
+  // When > 0, incremental adds run a windowed local solve instead of the
+  // full global pipeline: prior 3D points are imported, only the new
+  // image(s) are triangulated, and bundle adjustment optimizes just the new
+  // image(s) plus the `optimize_window_size` most covisible registered
+  // images. All other poses stay constant, so per-add cost is ~O(window)
+  // instead of O(N) and the output remains in the prior coordinate frame by
+  // construction (no Sim3 realignment needed). Typical values: 15-25.
+  // 0 (default) keeps the previous full-solve behavior.
+  int optimize_window_size = 0;
+
+  // When > 0 together with optimize_window_size, the pipeline still runs a
+  // full global solve every time the total number of registered images is a
+  // multiple of this value, as a periodic global refresh (e.g. 10). 0 means
+  // windowed solves only.
+  int full_solve_interval = 0;
   // ─────────────────────────────────────────────────────────────────────
 };
+
+// ── INCREMENTAL-ADD FREE FUNCTIONS ─────────────────────────────────────────
+
+// Evidence from a single pose-graph edge connecting a new (unregistered)
+// image to a prior (registered) image.
+struct BootstrapEdgeObservation {
+  // Relative pose of the edge, in the pose graph's stored orientation.
+  Rigid3d cam2_from_cam1;
+  // True if the prior image is cam1 of the edge (and the new image cam2).
+  bool prior_is_cam1 = true;
+  // Absolute pose of the prior image.
+  Rigid3d prior_cam_from_world;
+  // Non-negative weight, typically the edge's verified match count.
+  double weight = 1.0;
+};
+
+// Solves the absolute pose of one new image from edges to prior images.
+//
+// Rotation: each edge contributes one candidate absolute rotation
+//   R_new = R_rel * R_prior        (prior is cam1)
+//   R_new = R_rel^{-1} * R_prior   (prior is cam2)
+// combined by a weighted Karcher mean on SO(3). When more than one candidate
+// exists, candidates further than `max_candidate_deg` from the mean are
+// discarded and the mean is recomputed.
+//
+// Translation: each edge with a non-degenerate relative translation
+// contributes a world-space ray from the prior camera centre toward the new
+// camera centre; the centre is the weighted least-squares point closest to
+// all rays. Falls back to the weighted centroid of the prior centres when
+// the ray system is near-singular (e.g. a single ray or colinear priors).
+//
+// Gravity consistency gate for rotation candidates.
+struct BootstrapGravityGate {
+  // Measured gravity direction in the new image's camera frame (unit norm),
+  // e.g. from the image's pose prior.
+  Eigen::Vector3d gravity_in_new_cam;
+  // Gravity direction in the world frame of the prior reconstruction (unit
+  // norm), e.g. averaged from the prior images' gravity priors and poses.
+  Eigen::Vector3d gravity_in_world;
+  // Maximum angle (degrees) between measured and candidate-implied gravity.
+  double max_error_deg = 15.0;
+};
+
+// Returns std::nullopt when `observations` is empty.
+//
+// When `gravity_gate` is set, observations whose implied camera-frame
+// gravity (R_candidate * gravity_in_world) disagrees with the measured
+// gravity by more than max_error_deg are discarded before averaging. If all
+// observations fail the gate, solving proceeds ungated with a warning (a
+// single bad accelerometer sample must not block registration).
+std::optional<Rigid3d> SolvePoseFromPriorEdges(
+    const std::vector<BootstrapEdgeObservation>& observations,
+    double max_candidate_deg,
+    const std::optional<BootstrapGravityGate>& gravity_gate = std::nullopt);
 
 class GlobalMapper {
  public:
@@ -204,6 +283,24 @@ class GlobalMapper {
   const std::unordered_set<image_t>& PriorImageIds() const {
     return prior_image_ids_;
   }
+
+  // Windowed local solve for incremental adds (see
+  // GlobalMapperOptions::optimize_window_size). Imports the prior
+  // reconstruction's 3D points, triangulates the new image(s) against them,
+  // and runs iterative local bundle adjustment around each new image with a
+  // covisibility window of `options.optimize_window_size` images. Poses
+  // outside the window contribute constant-pose residuals only, so the
+  // output stays in the prior coordinate frame.
+  //
+  // Must be called AFTER LoadPriorPoses() and BootstrapNewImagePoses();
+  // `new_image_ids` is the return value of the latter. Images listed in
+  // `constant_image_ids` (e.g. gauge anchors) keep their poses constant
+  // even when they fall inside the covisibility window.
+  bool SolveIncrementalWindowed(
+      const GlobalMapperOptions& options,
+      const class Reconstruction& prior_reconstruction,
+      const std::unordered_set<image_t>& new_image_ids,
+      const std::unordered_set<image_t>& constant_image_ids = {});
   // ──────────────────────────────────────────────────────────────────────
 
   // Getter functions.
@@ -219,6 +316,10 @@ class GlobalMapper {
   // Populated by LoadPriorPoses(); consumed by BootstrapNewImagePoses()
   // and by the optional realignment step in IncrementalGlobalPipeline::Run().
   std::unordered_set<image_t> prior_image_ids_;
+
+  // Subsampled prior 3D points (world coordinates) used for a cheap
+  // cheirality sanity check on bootstrapped poses.
+  std::vector<Eigen::Vector3d> prior_points_sample_;
   // ──────────────────────────────────────────────────────────────────────
 };
 

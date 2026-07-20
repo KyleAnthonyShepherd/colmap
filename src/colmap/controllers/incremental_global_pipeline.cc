@@ -15,6 +15,11 @@
 #include "colmap/util/misc.h"
 #include "colmap/util/timer.h"
 
+#include <fstream>
+#include <iomanip>
+#include <limits>
+#include <sstream>
+
 namespace colmap {
 
 namespace {
@@ -42,6 +47,118 @@ void WarnInsufficientPriorFocalLengths() {
 }
 
 }  // namespace
+
+// ── Anchor-based gauge handling ────────────────────────────────────────────
+
+std::vector<image_t> SelectAnchorImages(const Reconstruction& reconstruction,
+                                        const int num_anchors) {
+  THROW_CHECK_GT(num_anchors, 0);
+
+  // Candidates sorted by number of 3D points (descending): well-observed
+  // images make stable anchors.
+  std::vector<std::pair<size_t, image_t>> candidates;
+  for (const image_t image_id : reconstruction.RegImageIds()) {
+    candidates.emplace_back(reconstruction.Image(image_id).NumPoints3D(),
+                            image_id);
+  }
+  std::sort(candidates.begin(), candidates.end(), std::greater<>());
+
+  // Greedy max-min-distance selection for wide mutual baselines.
+  std::vector<image_t> anchors;
+  std::vector<Eigen::Vector3d> anchor_centers;
+  for (int round = 0; round < num_anchors && !candidates.empty(); ++round) {
+    int best_idx = -1;
+    double best_min_dist = -1.0;
+    for (size_t i = 0; i < candidates.size(); ++i) {
+      const Eigen::Vector3d center =
+          reconstruction.Image(candidates[i].second).ProjectionCenter();
+      double min_dist = std::numeric_limits<double>::max();
+      for (const Eigen::Vector3d& anchor_center : anchor_centers) {
+        min_dist = std::min(min_dist, (center - anchor_center).norm());
+      }
+      if (anchor_centers.empty()) {
+        // First anchor: the best-observed image.
+        best_idx = 0;
+        break;
+      }
+      if (min_dist > best_min_dist) {
+        best_min_dist = min_dist;
+        best_idx = static_cast<int>(i);
+      }
+    }
+    if (best_idx < 0) break;
+    const image_t image_id = candidates[best_idx].second;
+    anchors.push_back(image_id);
+    anchor_centers.push_back(
+        reconstruction.Image(image_id).ProjectionCenter());
+    candidates.erase(candidates.begin() + best_idx);
+  }
+  return anchors;
+}
+
+bool ReadAnchors(const std::filesystem::path& path, AnchorSet* anchor_set) {
+  THROW_CHECK_NOTNULL(anchor_set);
+  anchor_set->anchors.clear();
+  std::ifstream file(path);
+  if (!file.is_open()) return false;
+  std::string line;
+  while (std::getline(file, line)) {
+    if (line.empty() || line[0] == '#') continue;
+    std::istringstream ss(line);
+    image_t image_id;
+    Eigen::Vector3d center;
+    if (!(ss >> image_id >> center.x() >> center.y() >> center.z())) {
+      LOG(WARNING) << "ReadAnchors: unparsable line in " << path << ": '"
+                   << line << "'";
+      anchor_set->anchors.clear();
+      return false;
+    }
+    anchor_set->anchors.emplace_back(image_id, center);
+  }
+  return !anchor_set->anchors.empty();
+}
+
+void WriteAnchors(const std::filesystem::path& path,
+                  const AnchorSet& anchor_set) {
+  std::ofstream file(path, std::ios::trunc);
+  THROW_CHECK(file.is_open()) << "Cannot write anchors to " << path;
+  file << "# Gauge anchors: image_id cx cy cz (fixed reference centres)\n";
+  file << std::setprecision(17);
+  for (const auto& [image_id, center] : anchor_set.anchors) {
+    file << image_id << " " << center.x() << " " << center.y() << " "
+         << center.z() << "\n";
+  }
+}
+
+bool RealignToAnchors(const AnchorSet& anchor_set,
+                      Reconstruction* reconstruction) {
+  THROW_CHECK_NOTNULL(reconstruction);
+  std::vector<Eigen::Vector3d> src;
+  std::vector<Eigen::Vector3d> tgt;
+  for (const auto& [image_id, stored_center] : anchor_set.anchors) {
+    if (!reconstruction->ExistsImage(image_id) ||
+        !reconstruction->Image(image_id).HasPose()) {
+      continue;
+    }
+    src.push_back(reconstruction->Image(image_id).ProjectionCenter());
+    tgt.push_back(stored_center);
+  }
+  if (src.size() < 3) {
+    LOG(WARNING) << "RealignToAnchors: only " << src.size()
+                 << " anchor(s) registered in the reconstruction; need 3.";
+    return false;
+  }
+  Sim3d anchors_from_output;
+  if (!EstimateSim3d(src, tgt, anchors_from_output)) {
+    LOG(WARNING) << "RealignToAnchors: Sim3 estimation failed.";
+    return false;
+  }
+  reconstruction->Transform(anchors_from_output);
+  LOG(INFO) << "Realigned output to " << src.size()
+            << " fixed anchor(s). Scale factor: "
+            << anchors_from_output.scale();
+  return true;
+}
 
 // ── Constructor ─────────────────────────────────────────────────────────────
 
@@ -98,6 +215,14 @@ void IncrementalGlobalPipeline::Run() {
     out = *reconstruction;
     if (!options_.image_path.empty()) {
       out.ExtractColorsForAllImages(options_.image_path);
+    }
+
+    // Select gauge anchors for the first successful reconstruction so that
+    // subsequent incremental adds have a fixed realignment reference.
+    anchors_.anchors.clear();
+    for (const image_t image_id : SelectAnchorImages(*reconstruction)) {
+      anchors_.anchors.emplace_back(
+          image_id, reconstruction->Image(image_id).ProjectionCenter());
     }
     return;
   }
@@ -169,61 +294,117 @@ void IncrementalGlobalPipeline::Run() {
     LOG(INFO) << "  image_id=" << id;
   }
 
-  // 7. Solve the remaining stages (track establishment, global positioning,
-  //    bundle adjustment, retriangulation).
+  // 7. Load the gauge anchors persisted next to the prior reconstruction,
+  //    if any (see AnchorSet).
+  AnchorSet prior_anchors;
+  const bool have_prior_anchors = ReadAnchors(
+      options_.prior_reconstruction_path / "anchors.txt", &prior_anchors);
+  if (have_prior_anchors) {
+    LOG(INFO) << "Loaded " << prior_anchors.anchors.size()
+              << " gauge anchor(s) from prior reconstruction.";
+  }
+
+  // 8. Solve. When optimize_window_size > 0 run a windowed local solve
+  //    (O(window) per add, output stays in the prior frame by
+  //    construction), except every full_solve_interval-th image where a
+  //    full global solve acts as a periodic refresh.
+  const bool windowed =
+      mapper_opts.optimize_window_size > 0 &&
+      !(mapper_opts.full_solve_interval > 0 &&
+        reconstruction->NumRegImages() % mapper_opts.full_solve_interval == 0);
+
   Timer run_timer;
   run_timer.Start();
-  mapper.Solve(mapper_opts);
+  if (windowed) {
+    LOG(INFO) << "Running windowed incremental solve (window size "
+              << mapper_opts.optimize_window_size << ").";
+    // Anchor poses stay constant even when they fall inside the window, so
+    // the gauge is fixed by construction.
+    if (!mapper.SolveIncrementalWindowed(mapper_opts,
+                                         prior_reconstruction,
+                                         bootstrapped,
+                                         prior_anchors.ImageIds())) {
+      LOG(ERROR) << "Windowed incremental solve failed.";
+      return;
+    }
+  } else {
+    mapper.Solve(mapper_opts);
+  }
   LOG(INFO) << "Incremental global solve done in "
             << run_timer.ElapsedSeconds() << " s";
 
-  // 8. Rig-scale alignment (matches standard GlobalPipeline behaviour).
-  AlignReconstructionToOrigRigScales(database_cache_->Rigs(),
-                                     reconstruction.get());
+  // 9. Rig-scale alignment (matches standard GlobalPipeline behaviour).
+  //    Skipped for windowed solves, which keep the prior scales.
+  if (!windowed) {
+    AlignReconstructionToOrigRigScales(database_cache_->Rigs(),
+                                       reconstruction.get());
+  }
 
-  // 9. Optional: re-align the full output to the prior coordinate frame.
-  //    Global positioning may have drifted the prior cameras slightly.
-  //    We compute a Sim3 from (output prior centres) → (original prior
-  //    centres) and apply it to the whole reconstruction.
-  if (mapper_opts.realign_to_prior_after_solve &&
-      prior_reg_ids.size() >= 3) {
-    // Collect the output positions of the prior images.
-    std::vector<Eigen::Vector3d> new_prior_centres;
-    new_prior_centres.reserve(prior_reg_ids.size());
-    size_t missing = 0;
-    for (const image_t id : prior_reg_ids) {
-      if (reconstruction->Image(id).HasPose()) {
-        new_prior_centres.push_back(
-            reconstruction->Image(id).ProjectionCenter());
-      } else {
-        ++missing;
+  // 10. Realign full-solve output back to the prior coordinate frame.
+  //     Preferred: Sim3 onto the FIXED anchor centres (no rolling-drift
+  //     compounding). Fallback: legacy rolling Sim3 over all prior centres.
+  //     Windowed solves never leave the prior frame, so realignment is
+  //     unnecessary there.
+  if (!windowed && mapper_opts.realign_to_prior_after_solve) {
+    const bool anchor_aligned =
+        have_prior_anchors &&
+        RealignToAnchors(prior_anchors, reconstruction.get());
+
+    if (!anchor_aligned && prior_reg_ids.size() >= 3) {
+      // Collect the output positions of the prior images.
+      std::vector<Eigen::Vector3d> new_prior_centres;
+      new_prior_centres.reserve(prior_reg_ids.size());
+      size_t missing = 0;
+      for (const image_t id : prior_reg_ids) {
+        if (reconstruction->Image(id).HasPose()) {
+          new_prior_centres.push_back(
+              reconstruction->Image(id).ProjectionCenter());
+        } else {
+          ++missing;
+        }
       }
-    }
 
-    if (missing > 0) {
-      LOG(WARNING) << "Realignment: " << missing
-                   << " prior image(s) not registered in output.";
-    }
+      if (missing > 0) {
+        LOG(WARNING) << "Realignment: " << missing
+                     << " prior image(s) not registered in output.";
+      }
 
-    if (new_prior_centres.size() >= 3) {
-      Sim3d prior_from_output;
-      if (EstimateSim3d(new_prior_centres, prior_centres, prior_from_output)) {
-        reconstruction->Transform(prior_from_output);
-        LOG(INFO) << "Realigned output to prior frame.  "
-                     "Scale factor: " << prior_from_output.scale();
+      if (new_prior_centres.size() >= 3) {
+        Sim3d prior_from_output;
+        if (EstimateSim3d(
+                new_prior_centres, prior_centres, prior_from_output)) {
+          reconstruction->Transform(prior_from_output);
+          LOG(INFO) << "Realigned output to prior frame (rolling).  "
+                       "Scale factor: " << prior_from_output.scale();
+        } else {
+          LOG(WARNING)
+              << "Realignment: Sim3 estimation failed; output may be in a "
+                 "different scale/frame than the prior reconstruction.";
+        }
       } else {
         LOG(WARNING)
-            << "Realignment: Sim3 estimation failed; output may be in a "
-               "different scale/frame than the prior reconstruction.";
+            << "Realignment skipped: fewer than 3 prior images are "
+               "registered in the output reconstruction.";
       }
-    } else {
-      LOG(WARNING)
-          << "Realignment skipped: fewer than 3 prior images are registered "
-             "in the output reconstruction.";
     }
   }
 
-  // 10. Write output.
+  // 11. Propagate or create the gauge anchors to persist with the output:
+  //     keep the prior anchors as the fixed reference when they exist,
+  //     otherwise select fresh ones from this output.
+  if (have_prior_anchors) {
+    anchors_ = prior_anchors;
+  } else {
+    anchors_.anchors.clear();
+    for (const image_t image_id : SelectAnchorImages(*reconstruction)) {
+      anchors_.anchors.emplace_back(
+          image_id, reconstruction->Image(image_id).ProjectionCenter());
+    }
+    LOG(INFO) << "Selected " << anchors_.anchors.size()
+              << " new gauge anchor(s).";
+  }
+
+  // 12. Write output.
   Reconstruction& out =
       *reconstruction_manager_->Get(reconstruction_manager_->Add());
   out = *reconstruction;
@@ -232,8 +413,6 @@ void IncrementalGlobalPipeline::Run() {
     LOG(INFO) << "Extracting colors ...";
     out.ExtractColorsForAllImages(options_.image_path);
   }
-
-  if (warn_focal) WarnInsufficientPriorFocalLengths();
 }
 
 }  // namespace colmap

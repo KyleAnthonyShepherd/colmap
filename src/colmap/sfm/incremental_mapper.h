@@ -131,6 +131,11 @@ class IncrementalMapper {
     // If reconstruction is provided as input, fix the existing image poses.
     bool fix_existing_frames = false;
 
+    // Frames whose rig_from_world poses are kept constant in bundle
+    // adjustment regardless of fix_existing_frames (e.g. gauge anchors in
+    // incremental-add workflows).
+    std::unordered_set<frame_t> constant_frames;
+
     // List of rigs for which to fix the sensor_from_rig transformation,
     // independent of ba_refine_sensor_from_rig.
     std::unordered_set<rig_t> constant_rigs;

@@ -38,6 +38,8 @@
 
 #include <vector>
 
+#include <optional>
+
 #include <Eigen/Core>
 #include <ceres/ceres.h>
 
@@ -49,6 +51,36 @@ struct AbsolutePoseEstimationOptions {
 
   // Options used for P3P RANSAC.
   RANSACOptions ransac_options;
+
+  // Optional known vertical (gravity) direction, as the same physical
+  // direction expressed in the world frame and in the camera frame. When both
+  // are set (and estimate_focal_length is false), the 2-point upright solver
+  // Up2PEstimator is used to generate hypotheses instead of P3P: the pose then
+  // has 4 unknowns instead of 6, which both shrinks the RANSAC budget and
+  // makes a given number of inliers constrain the pose more tightly. The
+  // winning model is still refined without the constraint by
+  // RefineAbsolutePose, so an imperfect gravity reading never enters the
+  // output pose.
+  std::optional<Eigen::Vector3d> gravity_in_world;
+  std::optional<Eigen::Vector3d> gravity_in_cam;
+
+  // Expected worst-case error of the gravity direction, in degrees.
+  //
+  // A hypothesis that exactly satisfies a slightly-wrong gravity direction is
+  // systematically biased by about focal_length * tan(error) pixels, so the
+  // RANSAC inlier threshold is widened by that amount while the upright solver
+  // is in use, or genuinely-correct correspondences get rejected.
+  //
+  // Keep this SMALL: the term grows dangerously fast, because it scales with
+  // focal length. focal * tan(1.5 deg) is 26 px at a 1000 px focal length,
+  // which on top of the default 12 px max_error triples the inlier threshold.
+  // Measured on a real 13-image session, 1.5 deg admitted enough outliers to
+  // register a weakly-connected image with a 27 deg rotation error that the
+  // same solver correctly declined at 0.5 deg; 0.5 deg matched the 0 deg
+  // result while leaving a little slack for imperfect priors (max rotation
+  // error 0.35 deg vs 0.38 deg). Raise it only against a measured gravity
+  // accuracy.
+  double gravity_uncertainty_deg = 0.5;
 
   AbsolutePoseEstimationOptions() {
     ransac_options.max_error = 12.0;

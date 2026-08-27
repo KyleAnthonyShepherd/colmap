@@ -294,9 +294,9 @@ bool IncrementalMapper::RegisterNextImage(const Options& options,
   // hence we skip some of the 2D-3D correspondences.
   if (tri_points2D.size() <
       static_cast<size_t>(options.abs_pose_min_num_inliers)) {
-    VLOG(2) << "Insufficient number of 2D-3D correspondences for registration ("
-            << tri_points2D.size() << " < " << options.abs_pose_min_num_inliers
-            << ")";
+    LOG(INFO) << "Insufficient 2D-3D correspondences to register image "
+              << image_id << " (" << tri_points2D.size() << " < "
+              << options.abs_pose_min_num_inliers << ")";
     return false;
   }
 
@@ -316,6 +316,14 @@ bool IncrementalMapper::RegisterNextImage(const Options& options,
   abs_pose_options.ransac_options.min_inlier_ratio =
       options.abs_pose_min_inlier_ratio;
   abs_pose_options.ransac_options.random_seed = options.random_seed;
+  abs_pose_options.gravity_uncertainty_deg = options.gravity_uncertainty_deg;
+  if (options.gravity_in_world.has_value()) {
+    const auto gravity_it = options.gravity_in_cam.find(image_id);
+    if (gravity_it != options.gravity_in_cam.end()) {
+      abs_pose_options.gravity_in_world = options.gravity_in_world;
+      abs_pose_options.gravity_in_cam = gravity_it->second;
+    }
+  }
 
   AbsolutePoseRefinementOptions abs_pose_refinement_options;
   if (options.constant_cameras.count(image.CameraId()) > 0) {
@@ -383,13 +391,18 @@ bool IncrementalMapper::RegisterNextImage(const Options& options,
                             &camera,
                             &num_inliers,
                             &inlier_mask)) {
-    VLOG(2) << "Absolute pose estimation failed";
+    LOG(INFO) << "Absolute pose estimation found no consensus for image "
+              << image_id << " over " << tri_points2D.size()
+              << " 2D-3D correspondence(s)";
     return false;
   }
 
   if (num_inliers < static_cast<size_t>(options.abs_pose_min_num_inliers)) {
-    VLOG(2) << "Absolute pose estimation failed due to insufficient inliers ("
-            << num_inliers << " < " << options.abs_pose_min_num_inliers << ")";
+    LOG(INFO) << "Absolute pose estimation for image " << image_id
+              << " found only " << num_inliers << " inlier(s) of "
+              << tri_points2D.size() << " correspondence(s) (ratio "
+              << static_cast<double>(num_inliers) / tri_points2D.size()
+              << "), below the required " << options.abs_pose_min_num_inliers;
     return false;
   }
 

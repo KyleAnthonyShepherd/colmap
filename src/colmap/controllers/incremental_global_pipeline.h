@@ -99,6 +99,76 @@ void WriteAnchors(const std::filesystem::path& path,
 bool RealignToAnchors(const AnchorSet& anchor_set,
                       Reconstruction* reconstruction);
 
+// ── Cross-add incremental state ────────────────────────────────────────────
+//
+// The server invokes this binary once per added image, so anything that must
+// be tracked *across* adds has to live on disk. Two files are written next to
+// the reconstruction, exactly like `anchors.txt`, so the server's
+// model-directory move carries them along:
+//
+//   incremental_state.txt   -- convergence + drift state (this struct)
+//   incremental_ledger.tsv  -- append-only, one row per add
+//
+// A missing or unparsable state file means "not converged, no history",
+// which degrades to the full solve path. That is the safe direction: the
+// full path is the one that can refine intrinsics.
+
+struct IncrementalState {
+  // Number of adds recorded so far.
+  int num_adds = 0;
+
+  // Consecutive adds whose intrinsics moved less than the tolerance.
+  int stable_adds = 0;
+
+  // Whether intrinsics are considered converged, i.e. whether adds may run
+  // the windowed path (see GlobalMapperOptions::optimize_window_size).
+  bool intrinsics_converged = false;
+
+  // Running average of each camera's mean focal length. The convergence
+  // test compares the current add's focal against this rather than against
+  // the previous add's value, so that stationary jitter passes and a genuine
+  // drift does not.
+  std::unordered_map<camera_t, double> camera_mean_focal;
+
+  // Running average of the mean reprojection error, tracked separately for
+  // each solve path. Negative means "no history".
+  //
+  // Separate per path because the two sit in different regimes: a full solve
+  // deletes all structure and re-triangulates from the current poses, so its
+  // residuals are near-zero by construction (measured ~0.001 px -- structure
+  // fitted to poses), while a windowed solve carries prior points forward
+  // and reports an ordinary SfM error (~0.5-1 px). Pooling them makes every
+  // windowed add look like catastrophic drift.
+  //
+  // A running average rather than the best-ever value, because windowed
+  // error plateaus rather than decaying: the first windowed add inherits
+  // pristine full-path structure and is systematically the best one, so a
+  // min-ever baseline fires on every add thereafter.
+  double reproj_ema_full = -1.0;
+  double reproj_ema_windowed = -1.0;
+
+  // Add index at which the last intrinsics refresh ran; -1 for never.
+  int last_refresh_add = -1;
+};
+
+// Reads/writes `incremental_state.txt` (one "key value..." line per field).
+// ReadIncrementalState returns false if the file does not exist or is
+// unparsable, leaving `state` default-constructed.
+bool ReadIncrementalState(const std::filesystem::path& path,
+                          IncrementalState* state);
+void WriteIncrementalState(const std::filesystem::path& path,
+                           const IncrementalState& state);
+
+// Appends one row to `incremental_ledger.tsv`, writing the header first if
+// the file does not exist yet. `prior_ledger_path` is the ledger carried
+// over from the prior reconstruction, copied forward when present so the
+// history survives the model-directory swap.
+void AppendIncrementalLedger(const std::filesystem::path& path,
+                             const std::filesystem::path& prior_path,
+                             int add_index,
+                             const char* path_label,
+                             const IncrementalAddLedger& ledger);
+
 // ── IncrementalGlobalPipeline ──────────────────────────────────────────────
 //
 // Controller that adds a single new image to an already-solved global
@@ -119,11 +189,26 @@ class IncrementalGlobalPipeline : public BaseController {
   // from the output. Empty until Run() has produced a reconstruction.
   const AnchorSet& Anchors() const { return anchors_; }
 
+  // The cross-add state to persist next to the output reconstruction,
+  // updated by Run(). Meaningless until Run() has produced a reconstruction.
+  const IncrementalState& State() const { return state_; }
+
+  // This add's structure accounting, to be appended to the ledger.
+  const IncrementalAddLedger& Ledger() const { return ledger_; }
+
+  // Which path this add took, for the ledger row: "full", "windowed", or
+  // "skipped" when no new image could be registered and the prior model was
+  // written through unchanged.
+  const char* PathLabel() const { return path_label_; }
+
  private:
   const IncrementalGlobalPipelineOptions options_;
   std::shared_ptr<DatabaseCache> database_cache_;
   std::shared_ptr<ReconstructionManager> reconstruction_manager_;
   AnchorSet anchors_;
+  IncrementalState state_;
+  IncrementalAddLedger ledger_;
+  const char* path_label_ = "full";
 };
 
 }  // namespace colmap

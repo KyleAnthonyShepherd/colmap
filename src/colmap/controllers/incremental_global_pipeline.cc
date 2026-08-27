@@ -130,6 +130,111 @@ void WriteAnchors(const std::filesystem::path& path,
   }
 }
 
+// ── Cross-add incremental state ────────────────────────────────────────────
+
+bool ReadIncrementalState(const std::filesystem::path& path,
+                          IncrementalState* state) {
+  THROW_CHECK_NOTNULL(state);
+  *state = IncrementalState();
+  std::ifstream file(path);
+  if (!file.is_open()) return false;
+  std::string line;
+  while (std::getline(file, line)) {
+    if (line.empty() || line[0] == '#') continue;
+    std::istringstream ss(line);
+    std::string key;
+    if (!(ss >> key)) continue;
+    bool ok = true;
+    if (key == "num_adds") {
+      ok = static_cast<bool>(ss >> state->num_adds);
+    } else if (key == "stable_adds") {
+      ok = static_cast<bool>(ss >> state->stable_adds);
+    } else if (key == "intrinsics_converged") {
+      int value = 0;
+      ok = static_cast<bool>(ss >> value);
+      state->intrinsics_converged = (value != 0);
+    } else if (key == "reproj_ema_full") {
+      ok = static_cast<bool>(ss >> state->reproj_ema_full);
+    } else if (key == "reproj_ema_windowed") {
+      ok = static_cast<bool>(ss >> state->reproj_ema_windowed);
+    } else if (key == "last_refresh_add") {
+      ok = static_cast<bool>(ss >> state->last_refresh_add);
+    } else if (key == "camera") {
+      camera_t camera_id = 0;
+      double mean_focal = 0.0;
+      ok = static_cast<bool>(ss >> camera_id >> mean_focal);
+      if (ok) state->camera_mean_focal[camera_id] = mean_focal;
+    } else {
+      LOG(WARNING) << "ReadIncrementalState: unknown key '" << key << "' in "
+                   << path << "; ignoring.";
+      continue;
+    }
+    if (!ok) {
+      LOG(WARNING) << "ReadIncrementalState: unparsable line in " << path
+                   << ": '" << line
+                   << "'; discarding state (treated as not converged).";
+      *state = IncrementalState();
+      return false;
+    }
+  }
+  return true;
+}
+
+void WriteIncrementalState(const std::filesystem::path& path,
+                           const IncrementalState& state) {
+  std::ofstream file(path, std::ios::trunc);
+  THROW_CHECK(file.is_open()) << "Cannot write incremental state to " << path;
+  file << "# Cross-add incremental state. Delete this file to force the\n"
+          "# pipeline back to full solves until intrinsics re-converge.\n";
+  file << std::setprecision(17);
+  file << "num_adds " << state.num_adds << "\n";
+  file << "stable_adds " << state.stable_adds << "\n";
+  file << "intrinsics_converged " << (state.intrinsics_converged ? 1 : 0)
+       << "\n";
+  file << "reproj_ema_full " << state.reproj_ema_full << "\n";
+  file << "reproj_ema_windowed " << state.reproj_ema_windowed << "\n";
+  file << "last_refresh_add " << state.last_refresh_add << "\n";
+  for (const auto& [camera_id, mean_focal] : state.camera_mean_focal) {
+    file << "camera " << camera_id << " " << mean_focal << "\n";
+  }
+}
+
+void AppendIncrementalLedger(const std::filesystem::path& path,
+                             const std::filesystem::path& prior_path,
+                             const int add_index,
+                             const char* path_label,
+                             const IncrementalAddLedger& ledger) {
+  // Carry the prior session's history forward, since each add writes into a
+  // fresh output directory that the server then swaps into place.
+  std::error_code ec;
+  if (!std::filesystem::exists(path) && std::filesystem::exists(prior_path)) {
+    std::filesystem::copy_file(prior_path, path, ec);
+    if (ec) {
+      LOG(WARNING) << "AppendIncrementalLedger: could not carry forward "
+                   << prior_path << ": " << ec.message();
+    }
+  }
+
+  const bool need_header = !std::filesystem::exists(path);
+  std::ofstream file(path, std::ios::app);
+  THROW_CHECK(file.is_open()) << "Cannot write ledger to " << path;
+  if (need_header) {
+    file << "add\tpath\tprior_points\timported\tdrop_missing_image\t"
+            "drop_bad_idx\tdrop_already_linked\tdrop_short_track\t"
+            "triangulated\tmerged\tcompleted\trecovered\tpoints_out\t"
+            "mean_reproj\tmean_track_len\tintrinsics_refreshed\n";
+  }
+  file << add_index << "\t" << path_label << "\t"
+       << ledger.prior_points_total << "\t" << ledger.imported << "\t"
+       << ledger.dropped_missing_image << "\t" << ledger.dropped_bad_point2D_idx
+       << "\t" << ledger.dropped_already_linked << "\t"
+       << ledger.dropped_short_track << "\t" << ledger.triangulated << "\t"
+       << ledger.merged << "\t" << ledger.completed << "\t"
+       << ledger.recovered << "\t" << ledger.points_out << "\t"
+       << ledger.mean_reproj_error << "\t" << ledger.mean_track_length << "\t"
+       << (ledger.intrinsics_refreshed ? 1 : 0) << "\n";
+}
+
 bool RealignToAnchors(const AnchorSet& anchor_set,
                       Reconstruction* reconstruction) {
   THROW_CHECK_NOTNULL(reconstruction);
@@ -267,6 +372,35 @@ void IncrementalGlobalPipeline::Run() {
   mapper_opts.random_seed = options_.random_seed;
   mapper_opts.skip_rotation_averaging = true;
 
+  // Global positioning re-solves camera positions from scratch, starting from
+  // uniformly random points in a 200^3 cube. On an incremental add it has no
+  // new information to contribute -- every prior camera already has a solved
+  // position and the new image's position comes from BootstrapNewImagePoses --
+  // so all it does is re-roll a good answer as a PRNG lottery. A
+  // weakly-connected image that lands outside the scene has its observations
+  // stripped by the reprojection filters, after which bundle adjustment has no
+  // residuals left to pull it back and it is written out with a garbage pose.
+  // Skip it and let bundle adjustment refine the positions against real
+  // reprojection residuals instead. See plan-5.
+  mapper_opts.skip_global_positioning = true;
+
+  // With global positioning skipped, EstablishTracks' output feeds only the
+  // bundle adjustment stage, and IterativeRetriangulateAndRefine then opens
+  // by deleting every one of those points. Worse, EstablishTracks creates
+  // tracks with default-constructed Point3D (xyz = origin) and nothing
+  // assigns them a position now that GP is gone, so that BA is
+  // triangulation-by-gradient-descent from a degenerate all-at-origin
+  // configuration -- roughly 31% of an add spent on structure that is
+  // discarded unused. Skip both. These stay tied to skip_global_positioning:
+  // if GP is ever re-enabled here it needs established tracks. See plan-6.
+  mapper_opts.skip_track_establishment = true;
+  mapper_opts.skip_bundle_adjustment = true;
+
+  // If global positioning is deliberately re-enabled on this path, at least
+  // seed it from the prior reconstruction's camera centers rather than
+  // discarding them.
+  mapper_opts.global_positioning.generate_random_positions = false;
+
   // 5. Create the mapper, initialise, and inject prior poses.
   auto reconstruction = std::make_shared<Reconstruction>();
   GlobalMapper mapper(database_cache_);
@@ -276,22 +410,74 @@ void IncrementalGlobalPipeline::Run() {
 
   LOG(INFO) << "Prior images loaded: " << mapper.PriorImageIds().size();
 
-  // 6. Bootstrap rotations for every unregistered image (should be 1 here).
-  const std::unordered_set<image_t> bootstrapped =
-      mapper.BootstrapNewImagePoses(mapper_opts);
+  // 6. Give the new image(s) a pose.
+  //
+  //    Preferred: PnP against the prior reconstruction's 3D points. Import
+  //    the prior structure first so there is something to match against --
+  //    the full path would otherwise not need it, but IterativeRetriangulate-
+  //    AndRefine deletes all points before rebuilding, so carrying them here
+  //    costs nothing and buys a far better pose.
+  //
+  //    Fallback: BootstrapNewImagePoses, which averages one rotation
+  //    candidate per pose-graph edge. That is the wrong operator for a
+  //    weakly-connected image -- noise edges outvote the few real ones --
+  //    so it now only handles what PnP declines. See plan-6.
+  std::unordered_set<image_t> new_image_ids;
+  if (mapper_opts.use_pnp_registration) {
+    if (mapper.ImportPriorPoints3D(mapper_opts, prior_reconstruction,
+                                   &ledger_)) {
+      new_image_ids = mapper.RegisterNewImagesByPnP(mapper_opts, &ledger_);
+    } else {
+      LOG(ERROR) << "Prior structure import failed; cannot register by PnP.";
+      return;
+    }
+  }
 
-  if (bootstrapped.empty()) {
-    LOG(ERROR)
-        << "IncrementalGlobalPipeline: failed to bootstrap any new image "
-           "rotation.  Ensure the new image has verified matches against at "
-           "least one prior image in the database and that "
-           "bootstrap_min_inliers is not too high.";
+  // BootstrapNewImagePoses skips images that already have a pose, so this
+  // composes as a fallback chain with no further bookkeeping. It is off by
+  // default once PnP has run: see
+  // GlobalMapperOptions::bootstrap_fallback_when_pnp_declines.
+  std::unordered_set<image_t> bootstrapped;
+  if (!mapper_opts.use_pnp_registration ||
+      mapper_opts.bootstrap_fallback_when_pnp_declines) {
+    bootstrapped = mapper.BootstrapNewImagePoses(mapper_opts);
+    new_image_ids.insert(bootstrapped.begin(), bootstrapped.end());
+  }
+
+  if (new_image_ids.empty()) {
+    // Not a failure. Registering nothing is the correct outcome when the new
+    // image cannot be placed against the existing structure: the prior model
+    // is written through unchanged and the image is retried on the next add,
+    // when there is more structure to match against. Forcing a pose here is
+    // what produces permanently broken images.
+    LOG(WARNING)
+        << "IncrementalGlobalPipeline: no new image could be registered "
+           "against the prior structure. Writing the prior model through "
+           "unchanged; the image will be retried on the next add.";
+
+    Reconstruction& passthrough =
+        *reconstruction_manager_->Get(reconstruction_manager_->Add());
+    passthrough = *reconstruction;
+    // Keep the prior anchors as the fixed gauge reference.
+    ReadAnchors(options_.prior_reconstruction_path / "anchors.txt", &anchors_);
+    ReadIncrementalState(
+        options_.prior_reconstruction_path / "incremental_state.txt", &state_);
+    // Still counts as an add so ledger rows stay uniquely indexed; the label
+    // is what distinguishes it.
+    state_.num_adds += 1;
+    path_label_ = "skipped";
+    ledger_.points_out = reconstruction->NumPoints3D();
+    ledger_.mean_reproj_error = reconstruction->ComputeMeanReprojectionError();
+    ledger_.mean_track_length = reconstruction->ComputeMeanTrackLength();
     return;
   }
 
-  LOG(INFO) << "Bootstrapped " << bootstrapped.size() << " new image(s): ";
-  for (const image_t id : bootstrapped) {
-    LOG(INFO) << "  image_id=" << id;
+  LOG(INFO) << "Registered " << new_image_ids.size() << " new image(s): "
+            << ledger_.pnp_registered << " by PnP, " << bootstrapped.size()
+            << " by bootstrap fallback.";
+  for (const image_t id : new_image_ids) {
+    LOG(INFO) << "  image_id=" << id
+              << (bootstrapped.count(id) ? " (bootstrap)" : " (pnp)");
   }
 
   // 7. Load the gauge anchors persisted next to the prior reconstruction,
@@ -304,14 +490,30 @@ void IncrementalGlobalPipeline::Run() {
               << " gauge anchor(s) from prior reconstruction.";
   }
 
-  // 8. Solve. When optimize_window_size > 0 run a windowed local solve
-  //    (O(window) per add, output stays in the prior frame by
-  //    construction), except every full_solve_interval-th image where a
-  //    full global solve acts as a periodic refresh.
+  // 8. Decide windowed vs full, then solve.
+  //
+  //    A windowed solve structurally cannot refine camera intrinsics: both
+  //    AdjustLocalBundle and AddPointToProblem force the camera constant
+  //    whenever the window is smaller than the model, which with one shared
+  //    camera is always. So whatever intrinsics we hold when we first go
+  //    windowed would be frozen for the rest of the session -- the exact
+  //    setup that collapses a model (refined geometry vs. unrefined
+  //    intrinsics). Run full solves, which do refine intrinsics globally,
+  //    until they converge; only then switch to windowed adds. See plan-6.
+  ReadIncrementalState(
+      options_.prior_reconstruction_path / "incremental_state.txt", &state_);
+
   const bool windowed =
-      mapper_opts.optimize_window_size > 0 &&
-      !(mapper_opts.full_solve_interval > 0 &&
-        reconstruction->NumRegImages() % mapper_opts.full_solve_interval == 0);
+      mapper_opts.optimize_window_size > 0 && state_.intrinsics_converged;
+  path_label_ = windowed ? "windowed" : "full";
+
+  if (mapper_opts.optimize_window_size > 0 && !windowed) {
+    LOG(INFO) << "Windowed solves requested but intrinsics have not "
+                 "converged yet (add " << state_.num_adds << ", "
+              << state_.stable_adds
+              << " consecutive stable add(s)); running a full solve so "
+                 "intrinsics can be refined globally.";
+  }
 
   Timer run_timer;
   run_timer.Start();
@@ -322,13 +524,18 @@ void IncrementalGlobalPipeline::Run() {
     // the gauge is fixed by construction.
     if (!mapper.SolveIncrementalWindowed(mapper_opts,
                                          prior_reconstruction,
-                                         bootstrapped,
-                                         prior_anchors.ImageIds())) {
+                                         new_image_ids,
+                                         prior_anchors.ImageIds(),
+                                         &ledger_)) {
       LOG(ERROR) << "Windowed incremental solve failed.";
       return;
     }
   } else {
     mapper.Solve(mapper_opts);
+    ledger_.prior_points_total = prior_reconstruction.NumPoints3D();
+    ledger_.points_out = reconstruction->NumPoints3D();
+    ledger_.mean_reproj_error = reconstruction->ComputeMeanReprojectionError();
+    ledger_.mean_track_length = reconstruction->ComputeMeanTrackLength();
   }
   LOG(INFO) << "Incremental global solve done in "
             << run_timer.ElapsedSeconds() << " s";
@@ -404,7 +611,114 @@ void IncrementalGlobalPipeline::Run() {
               << " new gauge anchor(s).";
   }
 
-  // 12. Write output.
+  // 12. Drift monitor and intrinsics-convergence bookkeeping.
+  //
+  //     The drift check runs first: if this add's reprojection error has
+  //     risen well above the best we have ever seen, the frozen intrinsics
+  //     are the prime suspect, so give that global parameter its own global
+  //     pass and recover the structure that was filtered away while it was
+  //     wrong. Convergence is then evaluated against the *post-refresh*
+  //     intrinsics.
+  state_.num_adds += 1;
+
+  double& reproj_ema =
+      windowed ? state_.reproj_ema_windowed : state_.reproj_ema_full;
+
+  if (mapper_opts.intrinsics_drift_factor > 0.0 && reproj_ema > 0.0 &&
+      ledger_.mean_reproj_error >
+          reproj_ema * mapper_opts.intrinsics_drift_factor) {
+    LOG(WARNING) << "Reprojection error drift: " << ledger_.mean_reproj_error
+                 << " exceeds the running " << (windowed ? "windowed" : "full")
+                 << "-path average " << reproj_ema << " by more than "
+                 << mapper_opts.intrinsics_drift_factor
+                 << "x. Running global refresh + structure recovery.";
+    mapper.RefreshIntrinsicsGlobally(mapper_opts, &ledger_);
+    state_.last_refresh_add = state_.num_adds;
+    // Deliberately NOT resetting the convergence state here. Forcing the
+    // next add back onto the full path would rebuild the whole model --
+    // exactly the O(N) cost this is all trying to remove -- on the strength
+    // of an indirect signal. If the intrinsics genuinely moved, the
+    // stationarity test below detects it directly and un-converges on its
+    // own; if they did not, the refresh was a cheap no-op plus some
+    // recovered structure, which is pure gain.
+  }
+
+  // Convergence test: every camera's mean focal length must sit within the
+  // relative tolerance of its running average, for intrinsics_min_stable_adds
+  // consecutive adds.
+  //
+  // This is deliberately a stationarity test rather than a decay test. The
+  // focal estimate never stops moving -- each full solve rebuilds all
+  // structure and re-lands slightly differently -- so comparing consecutive
+  // adds just samples that noise and a strict threshold never fires. Testing
+  // against the running average asks the question we actually care about:
+  // is the estimate sitting in a tight band (fine to freeze), or is it
+  // walking somewhere (not fine to freeze)?
+  double max_rel_dev = -1.0;
+  {
+    // Exponential running average; 0.5 keeps it responsive to a genuine
+    // move while still averaging out single-add jitter.
+    constexpr double kFocalEmaAlpha = 0.5;
+
+    std::unordered_map<camera_t, double> mean_focal;
+    for (const auto& [camera_id, camera] : reconstruction->Cameras()) {
+      mean_focal[camera_id] = camera.MeanFocalLength();
+    }
+
+    bool stable = !mean_focal.empty() && !state_.camera_mean_focal.empty();
+    std::unordered_map<camera_t, double> updated_ema;
+    for (const auto& [camera_id, focal] : mean_focal) {
+      const auto it = state_.camera_mean_focal.find(camera_id);
+      if (it == state_.camera_mean_focal.end() || it->second <= 0.0) {
+        // A camera we have never seen before cannot be called stable, and
+        // seeds its average with the current value.
+        stable = false;
+        updated_ema[camera_id] = focal;
+        continue;
+      }
+      const double ema = it->second;
+      const double rel_dev = std::abs(focal - ema) / std::abs(ema);
+      max_rel_dev = std::max(max_rel_dev, rel_dev);
+      if (rel_dev > mapper_opts.intrinsics_convergence_rel_tol) {
+        stable = false;
+      }
+      updated_ema[camera_id] = kFocalEmaAlpha * focal + (1.0 - kFocalEmaAlpha) * ema;
+    }
+
+    state_.stable_adds = stable ? state_.stable_adds + 1 : 0;
+    state_.camera_mean_focal = std::move(updated_ema);
+
+    const bool converged =
+        state_.stable_adds >= mapper_opts.intrinsics_min_stable_adds &&
+        state_.num_adds >= mapper_opts.intrinsics_min_adds;
+    if (converged && !state_.intrinsics_converged) {
+      LOG(INFO) << "Intrinsics converged after " << state_.num_adds
+                << " add(s) (max relative focal deviation " << max_rel_dev
+                << "); subsequent adds may run windowed.";
+    }
+    state_.intrinsics_converged = converged;
+  }
+
+  if (ledger_.mean_reproj_error > 0.0) {
+    constexpr double kReprojEmaAlpha = 0.5;
+    reproj_ema = (reproj_ema <= 0.0)
+                     ? ledger_.mean_reproj_error
+                     : kReprojEmaAlpha * ledger_.mean_reproj_error +
+                           (1.0 - kReprojEmaAlpha) * reproj_ema;
+  }
+
+  LOG(INFO) << "Add " << state_.num_adds << " (" << (windowed ? "windowed"
+                                                              : "full")
+            << "): " << ledger_.points_out << " point(s), mean track length "
+            << ledger_.mean_track_length << ", mean reproj error "
+            << ledger_.mean_reproj_error << "; intrinsics "
+            << (state_.intrinsics_converged ? "converged" : "not converged")
+            << " (" << state_.stable_adds
+            << " stable add(s), max relative focal deviation " << max_rel_dev
+            << " vs tolerance " << mapper_opts.intrinsics_convergence_rel_tol
+            << ").";
+
+  // 13. Write output.
   Reconstruction& out =
       *reconstruction_manager_->Get(reconstruction_manager_->Add());
   out = *reconstruction;

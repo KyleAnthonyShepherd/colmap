@@ -452,12 +452,43 @@ int RunIncrementalGlobalMapper(int argc, char** argv) {
       "optimize_window_size",
       &options.global_mapper->mapper.optimize_window_size,
       "When > 0, run a windowed local solve around the new image(s) with "
-      "this many covisible images instead of a full global solve.");
+      "this many covisible images instead of a full global solve. Windowed "
+      "adds only begin once intrinsics have converged; until then full "
+      "solves run so intrinsics can be refined globally.");
   options.AddDefaultOption(
-      "full_solve_interval",
-      &options.global_mapper->mapper.full_solve_interval,
-      "With optimize_window_size > 0: run a full global solve every time "
-      "the registered image count is a multiple of this value; 0 = never.");
+      "intrinsics_convergence_rel_tol",
+      &options.global_mapper->mapper.intrinsics_convergence_rel_tol,
+      "Max relative change in a camera's mean focal length between adds for "
+      "that add to count as stable.");
+  options.AddDefaultOption(
+      "intrinsics_min_stable_adds",
+      &options.global_mapper->mapper.intrinsics_min_stable_adds,
+      "Consecutive stable adds required to declare intrinsics converged.");
+  options.AddDefaultOption(
+      "intrinsics_min_adds",
+      &options.global_mapper->mapper.intrinsics_min_adds,
+      "Minimum number of adds before convergence may be declared.");
+  options.AddDefaultOption(
+      "intrinsics_drift_factor",
+      &options.global_mapper->mapper.intrinsics_drift_factor,
+      "Run an intrinsics-only global refresh plus structure recovery when "
+      "mean reprojection error exceeds the best recorded times this factor; "
+      "<= 0 disables the drift monitor.");
+  options.AddDefaultOption(
+      "pnp_min_num_inliers",
+      &options.global_mapper->mapper.pnp_min_num_inliers,
+      "Minimum inlier 2D-3D correspondences to register a new image by PnP.");
+  options.AddDefaultOption(
+      "gravity_uncertainty_deg",
+      &options.global_mapper->mapper.gravity_uncertainty_deg,
+      "Expected worst-case gravity prior error (deg); widens the PnP inlier "
+      "threshold by focal*tan(this) while the upright solver is in use.");
+  options.AddDefaultOption(
+      "allow_lossy_prior_import",
+      &options.global_mapper->mapper.allow_lossy_prior_import,
+      "Continue a windowed add even when prior 3D structure could not be "
+      "imported faithfully. Off by default: a lossy import means the prior "
+      "and the database disagree, and the loss compounds across adds.");
 
   if (!options.Parse(argc, argv)) {
     return EXIT_FAILURE;
@@ -503,12 +534,26 @@ int RunIncrementalGlobalMapper(int argc, char** argv) {
   // Persist the gauge anchors next to the reconstruction files so they
   // survive the caller's promotion of the output directory and act as the
   // fixed realignment reference for all subsequent incremental adds.
+  const std::filesystem::path numbered_dir = output_path / "0";
+  const std::filesystem::path model_dir =
+      ExistsDir(numbered_dir) ? numbered_dir : output_path;
+
   if (!pipeline.Anchors().Empty()) {
-    const std::filesystem::path numbered_dir = output_path / "0";
-    WriteAnchors((ExistsDir(numbered_dir) ? numbered_dir : output_path) /
-                     "anchors.txt",
-                 pipeline.Anchors());
+    WriteAnchors(model_dir / "anchors.txt", pipeline.Anchors());
   }
+
+  // Persist the cross-add state alongside the anchors: the server runs this
+  // binary once per added image, so intrinsics-convergence and drift
+  // tracking only survive on disk. The ledger carries the whole session's
+  // structure accounting forward so decay across a drip-fed session is a
+  // query over a file rather than a guess.
+  WriteIncrementalState(model_dir / "incremental_state.txt", pipeline.State());
+  AppendIncrementalLedger(
+      model_dir / "incremental_ledger.tsv",
+      prior_reconstruction_path / "incremental_ledger.tsv",
+      pipeline.State().num_adds,
+      pipeline.PathLabel(),
+      pipeline.Ledger());
 
   return EXIT_SUCCESS;
 }

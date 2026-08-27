@@ -38,6 +38,7 @@
 #include "colmap/estimators/solvers/absolute_pose.h"
 #include "colmap/estimators/solvers/essential_matrix.h"
 #include "colmap/geometry/essential_matrix.h"
+#include "colmap/math/math.h"
 #include "colmap/optim/loransac.h"
 #include "colmap/util/logging.h"
 
@@ -95,18 +96,53 @@ bool EstimateAbsolutePose(const AbsolutePoseEstimationOptions& options,
 
     ImgFromCamFunc img_from_cam_func =
         std::bind(&Camera::ImgFromCam, camera, std::placeholders::_1);
-    LORANSAC<P3PEstimator, EPNPEstimator> ransac(
-        options.ransac_options,
-        P3PEstimator(img_from_cam_func),
-        EPNPEstimator(img_from_cam_func));
-    auto report = ransac.Estimate(points2D_with_rays, points3D);
-    if (report.success) {
-      *cam_from_world = Rigid3d(Eigen::Quaterniond(report.model.leftCols<3>()),
-                                report.model.col(3));
+
+    const bool use_gravity = options.gravity_in_world.has_value() &&
+                             options.gravity_in_cam.has_value();
+
+    RANSACOptions ransac_options = options.ransac_options;
+    if (use_gravity && options.gravity_uncertainty_deg > 0) {
+      // Budget for the systematic bias a slightly-wrong gravity direction
+      // induces, so correct correspondences survive the inlier test.
+      ransac_options.max_error +=
+          camera->MeanFocalLength() *
+          std::tan(DegToRad(options.gravity_uncertainty_deg));
+    }
+
+    // The two RANSAC instantiations have distinct Report types, so pull the
+    // results out inside each branch rather than sharing a variable.
+    bool success = false;
+    Eigen::Matrix3x4d model = Eigen::Matrix3x4d::Zero();
+    if (use_gravity) {
+      LORANSAC<Up2PEstimator, EPNPEstimator> ransac(
+          ransac_options,
+          Up2PEstimator(img_from_cam_func,
+                        *options.gravity_in_world,
+                        *options.gravity_in_cam),
+          EPNPEstimator(img_from_cam_func));
+      auto report = ransac.Estimate(points2D_with_rays, points3D);
+      success = report.success;
+      model = report.model;
       *num_inliers = report.support.num_inliers;
       *inlier_mask = std::move(report.inlier_mask);
+    } else {
+      LORANSAC<P3PEstimator, EPNPEstimator> ransac(
+          ransac_options,
+          P3PEstimator(img_from_cam_func),
+          EPNPEstimator(img_from_cam_func));
+      auto report = ransac.Estimate(points2D_with_rays, points3D);
+      success = report.success;
+      model = report.model;
+      *num_inliers = report.support.num_inliers;
+      *inlier_mask = std::move(report.inlier_mask);
+    }
+    if (success) {
+      *cam_from_world =
+          Rigid3d(Eigen::Quaterniond(model.leftCols<3>()), model.col(3));
       return true;
     }
+    *num_inliers = 0;
+    inlier_mask->clear();
   }
 
   return false;

@@ -142,12 +142,143 @@ struct GlobalMapperOptions {
   // 0 (default) keeps the previous full-solve behavior.
   int optimize_window_size = 0;
 
-  // When > 0 together with optimize_window_size, the pipeline still runs a
-  // full global solve every time the total number of registered images is a
-  // multiple of this value, as a periodic global refresh (e.g. 10). 0 means
-  // windowed solves only.
-  int full_solve_interval = 0;
+  // A windowed solve structurally cannot refine camera intrinsics: both
+  // AdjustLocalBundle (num_images < num_reg_images_per_camera) and
+  // AddPointToProblem (any track element outside the config) force the
+  // camera's intrinsics constant. With a single shared camera, whatever
+  // intrinsics the model holds when it goes windowed are frozen forever --
+  // which is how a model ends up optimizing refined geometry against
+  // unrefined intrinsics and collapsing. So the pipeline runs full solves
+  // (which do refine intrinsics globally) until intrinsics converge, and
+  // only then switches to windowed adds. See plan-6 sec. 5.
+
+  // Maximum relative deviation of a camera's mean focal length from its
+  // running average for that add to count as "stable".
+  //
+  // This is a stationarity test, not a decay test. The focal estimate does
+  // not settle to a fixed value: each full solve rebuilds all structure and
+  // re-lands slightly differently, so on real data it jitters in a band
+  // (measured: 3e-4 to 3e-3 relative, non-decreasing, around 985.7 px). A
+  // consecutive-change test against that noise floor never fires. What the
+  // gate actually needs to distinguish is "roughly right" from "grossly
+  // wrong" -- the failure it exists to prevent is freezing the intrinsics at
+  // something like the database's coarse field-of-view prior, which can be
+  // 30-40% off. 5e-3 sits above the measured rebuild-noise band and two
+  // orders of magnitude below a gross error.
+  double intrinsics_convergence_rel_tol = 5e-3;
+
+  // Number of consecutive stable adds required to declare convergence.
+  int intrinsics_min_stable_adds = 2;
+
+  // Minimum number of adds before convergence may be declared at all.
+  int intrinsics_min_adds = 3;
+
+  // Drift trigger: when an add's mean reprojection error exceeds the best
+  // ever recorded times this factor, run an intrinsics-only global bundle
+  // adjustment plus a global structure-recovery pass, and re-validate
+  // convergence. <= 0 disables the drift monitor.
+  double intrinsics_drift_factor = 1.25;
+
+  // Register new images by absolute pose (PnP + RANSAC) against the prior
+  // reconstruction's 3D points, falling back to BootstrapNewImagePoses only
+  // for images PnP declines.
+  //
+  // The bootstrap averages one rotation candidate per pose-graph edge. For a
+  // weakly-connected image that is the wrong operator: measured on
+  // sessions/camsnap, img_0008 has nine edges of which one carries 456
+  // inliers, one 171, and seven carry 16-20 (i.e. noise). Averaging lets the
+  // seven outvote the two, and the gravity gate then discards candidates
+  // weight-blind on top of that. The result was a rotation off by 2.8 deg
+  // (and 45-75 deg for two other images), after which triangulation finds no
+  // consistent rays and the image is written out registered with zero
+  // observations -- with no residuals left for bundle adjustment to pull it
+  // back. PnP uses the prior 3D structure directly and RANSAC *rejects*
+  // outliers rather than averaging them, and it can decline (returning
+  // false) instead of emitting a confident wrong pose.
+  bool use_pnp_registration = true;
+
+  // Whether an image PnP declines should still be handed to
+  // BootstrapNewImagePoses. Off by default, because the decline is the
+  // useful signal: measured on sessions/camsnap, PnP accepted 6 of 8 images
+  // and declined exactly the two that the bootstrap went on to register with
+  // a garbage pose and zero observations. An unregistered image is strictly
+  // better than a mis-registered one -- it is retried automatically on every
+  // later add (RegisterNewImagesByPnP sweeps all poseless images, not just
+  // the newest), and by then there is usually more structure to match
+  // against, whereas a bad pose with zero observations gives bundle
+  // adjustment no residuals to recover from and is permanent.
+  bool bootstrap_fallback_when_pnp_declines = false;
+
+  // Minimum number of inlier 2D-3D correspondences for PnP registration
+  // (IncrementalMapper::Options::abs_pose_min_num_inliers). COLMAP's default
+  // of 30 is tuned for from-scratch incremental mapping; a weakly-connected
+  // image on the incremental path can have only 35-64 correspondences in
+  // total, so 30 inliers is unreachable for it even when RANSAC finds a clean
+  // consensus at a healthy inlier ratio.
+  int pnp_min_num_inliers = 30;
+
+  // Expected worst-case error of the gravity priors, in degrees. Widens the
+  // PnP inlier threshold by focal*tan(this) while the upright solver is in
+  // use. Kept small deliberately -- the term scales with focal length and
+  // admitting outliers is worse than rejecting a few correct
+  // correspondences. See
+  // AbsolutePoseEstimationOptions::gravity_uncertainty_deg.
+  double gravity_uncertainty_deg = 0.5;
+
+  // The windowed prior-structure import is lossless on a healthy prior: its
+  // only drop paths signal prior/database disagreement. By default any drop
+  // fails the add, leaving the last good reconstruction in place rather than
+  // silently writing a degraded one. Set true to import what it can and
+  // continue anyway.
+  bool allow_lossy_prior_import = false;
+
   // ─────────────────────────────────────────────────────────────────────
+};
+
+// ── INCREMENTAL-ADD ACCOUNTING ─────────────────────────────────────────────
+
+// Per-add structure accounting for an incremental windowed solve.
+//
+// Every 3D point that enters an add is accounted for on exit. Filtering
+// inside local bundle adjustment deletes observations from *imported prior*
+// points, not just new ones, so a drip-fed session can bleed structure
+// steadily while every individual add "succeeds". The ledger makes that
+// visible as data instead of a guess: it is appended to
+// `incremental_ledger.tsv` beside the model, one row per add.
+//
+// The import counters are all zero on a healthy prior -- they only become
+// non-zero when the prior reconstruction and the database disagree.
+struct IncrementalAddLedger {
+  // Prior structure import.
+  size_t prior_points_total = 0;
+  size_t imported = 0;
+  size_t dropped_missing_image = 0;
+  size_t dropped_bad_point2D_idx = 0;
+  size_t dropped_already_linked = 0;
+  size_t dropped_short_track = 0;
+
+  // New images registered by PnP rather than by the bootstrap fallback.
+  size_t pnp_registered = 0;
+
+  // Structure changes during the solve.
+  size_t triangulated = 0;
+  size_t merged = 0;
+  size_t completed = 0;
+  size_t recovered = 0;  // from the global recovery pass, when it ran
+  size_t filtered = 0;
+
+  // Outcome.
+  size_t points_out = 0;
+  double mean_reproj_error = 0.0;
+  double mean_track_length = 0.0;
+  bool intrinsics_refreshed = false;
+
+  // Total prior points lost at import time. Zero unless the prior and the
+  // database disagree.
+  size_t DroppedAtImport() const {
+    return dropped_missing_image + dropped_bad_point2D_idx +
+           dropped_already_linked + dropped_short_track;
+  }
 };
 
 // ── INCREMENTAL-ADD FREE FUNCTIONS ─────────────────────────────────────────
@@ -284,6 +415,29 @@ class GlobalMapper {
     return prior_image_ids_;
   }
 
+  // Imports the prior reconstruction's 3D points into the current
+  // reconstruction, preserving point3D_t ids and re-linking each track
+  // element's 2D-3D association. Must be called AFTER LoadPriorPoses().
+  //
+  // On a healthy prior this is lossless; every drop path signals that the
+  // prior and the database disagree. Returns false on any loss unless
+  // options.allow_lossy_prior_import is set. Accumulates into `ledger`.
+  bool ImportPriorPoints3D(const GlobalMapperOptions& options,
+                           const class Reconstruction& prior_reconstruction,
+                           IncrementalAddLedger* ledger = nullptr);
+
+  // Registers every currently unregistered image by absolute pose against
+  // the already-imported prior structure, and returns the set that was
+  // registered. Requires ImportPriorPoints3D() to have run first; returns
+  // empty (with a warning) if there is no structure to match against.
+  //
+  // Images this declines are left unregistered so BootstrapNewImagePoses()
+  // can still try them -- it skips images that already have a pose, so the
+  // two compose as a fallback chain without further bookkeeping.
+  std::unordered_set<image_t> RegisterNewImagesByPnP(
+      const GlobalMapperOptions& options,
+      IncrementalAddLedger* ledger = nullptr);
+
   // Windowed local solve for incremental adds (see
   // GlobalMapperOptions::optimize_window_size). Imports the prior
   // reconstruction's 3D points, triangulates the new image(s) against them,
@@ -296,17 +450,44 @@ class GlobalMapper {
   // `new_image_ids` is the return value of the latter. Images listed in
   // `constant_image_ids` (e.g. gauge anchors) keep their poses constant
   // even when they fall inside the covisibility window.
+  //
+  // Fails (returns false) if any prior 3D structure could not be imported
+  // faithfully, unless options.allow_lossy_prior_import is set. When
+  // `ledger` is non-null it receives this add's structure accounting.
   bool SolveIncrementalWindowed(
       const GlobalMapperOptions& options,
       const class Reconstruction& prior_reconstruction,
       const std::unordered_set<image_t>& new_image_ids,
-      const std::unordered_set<image_t>& constant_image_ids = {});
+      const std::unordered_set<image_t>& constant_image_ids = {},
+      IncrementalAddLedger* ledger = nullptr);
+
+  // Intrinsics-only global bundle adjustment followed by global structure
+  // recovery. A local window can never refine intrinsics (see
+  // GlobalMapperOptions::intrinsics_drift_factor), so this gives that one
+  // global parameter its own global pass: all registered images, every pose
+  // and every 3D point held constant, only camera params free. That is a
+  // ~4-8 DOF problem regardless of N.
+  //
+  // Then re-establishes structure that was filtered away while the
+  // intrinsics were wrong: a filtered observation is not destroyed, the
+  // feature match is still in the database, so it can be recovered once the
+  // intrinsics are corrected. Returns the number of observations recovered
+  // and accumulates into `ledger` when non-null.
+  size_t RefreshIntrinsicsGlobally(const GlobalMapperOptions& options,
+                                   IncrementalAddLedger* ledger = nullptr);
   // ──────────────────────────────────────────────────────────────────────
 
   // Getter functions.
   std::shared_ptr<class Reconstruction> Reconstruction() const;
 
  private:
+  // Collects per-image gravity priors from the database and derives the
+  // gravity direction in the reconstruction's world frame by averaging the
+  // prior images' measurements through their known poses. Returns nullopt
+  // when no registered prior image carries a gravity prior.
+  std::optional<Eigen::Vector3d> CollectGravityPriors(
+      std::unordered_map<image_t, Eigen::Vector3d>* image_to_gravity) const;
+
   std::shared_ptr<const DatabaseCache> database_cache_;
   std::shared_ptr<class PoseGraph> pose_graph_;
   std::shared_ptr<class Reconstruction> reconstruction_;

@@ -1,5 +1,7 @@
 #include "colmap/estimators/global_positioning.h"
 
+#include <limits>
+
 #include "colmap/estimators/cost_functions/motion_averaging.h"
 #include "colmap/math/random.h"
 #include "colmap/util/cuda.h"
@@ -124,11 +126,35 @@ void GlobalPositioner::InitializeRandomPositions(
     if (constrained_positions.find(frame_id) == constrained_positions.end()) {
       continue;
     }
-    if (options_.generate_random_positions && options_.optimize_positions) {
+    // Frames reach this set via pose graph edges too, which does not imply a
+    // pose, so fall back to a random center for any frame without one.
+    if ((options_.generate_random_positions && options_.optimize_positions) ||
+        !frame.HasPose()) {
       frame_centers_[frame_id] = 100.0 * RandVector3d(-1, 1);
     } else {
       frame_centers_[frame_id] = frame.RigFromWorld().TgtOriginInSrc();
     }
+  }
+
+  // Record the box the frame centers actually occupy, so that random point
+  // positions are drawn at the same scale. With random positions this
+  // reproduces the original 200^3 cube; with prior positions it matches the
+  // real scene extent, which keeps the point and camera initializations
+  // mutually consistent.
+  position_box_center_ = Eigen::Vector3d::Zero();
+  position_box_radius_ = 100.0;
+  if (!options_.generate_random_positions && !frame_centers_.empty()) {
+    Eigen::Vector3d min_corner =
+        Eigen::Vector3d::Constant(std::numeric_limits<double>::max());
+    Eigen::Vector3d max_corner =
+        Eigen::Vector3d::Constant(std::numeric_limits<double>::lowest());
+    for (const auto& [frame_id, center] : frame_centers_) {
+      min_corner = min_corner.cwiseMin(center);
+      max_corner = max_corner.cwiseMax(center);
+    }
+    position_box_center_ = 0.5 * (min_corner + max_corner);
+    position_box_radius_ =
+        std::max(1e-3, 0.5 * (max_corner - min_corner).maxCoeff());
   }
 
   VLOG(2) << "Constrained positions: " << constrained_positions.size();
@@ -164,7 +190,8 @@ void GlobalPositioner::AddPoint3DToProblem(point3D_t point3D_id,
 
   // Only set the points to be random if they are needed to be optimized
   if (random_initialization) {
-    point3D.xyz = 100.0 * RandVector3d(-1, 1);
+    point3D.xyz =
+        position_box_center_ + position_box_radius_ * RandVector3d(-1, 1);
   }
 
   // For each view in the track add the point to camera correspondences.

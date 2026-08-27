@@ -1,3 +1,4 @@
+#define _USE_MATH_DEFINES
 // Copyright (c), ETH Zurich and UNC Chapel Hill.
 // All rights reserved.
 //
@@ -33,9 +34,14 @@
 #include "colmap/optim/ransac.h"
 #include "colmap/scene/camera.h"
 #include "colmap/sensor/models.h"
+#include "colmap/math/random.h"
 #include "colmap/util/eigen_alignment.h"
 
+#include <cmath>
+#include <limits>
+
 #include <Eigen/Core>
+#include <Eigen/Geometry>
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
 
@@ -342,6 +348,120 @@ TEST(ComputeSquaredReprojectionError, Nominal) {
                                    camera.FocalLength() * camera.FocalLength(),
                                    std::numeric_limits<double>::max(),
                                    std::numeric_limits<double>::max()));
+}
+
+// Exact recovery from two correspondences over random gravity-consistent
+// poses. This is the port of the reference implementation's self-test: any
+// error in the (cos, sin, t) parametrization shows up here immediately, since
+// the minimal case must be solved to machine precision.
+TEST(AbsolutePose, Up2PExactRecovery) {
+  SetPRNGSeed(0);
+
+  Camera camera = Camera::CreateFromModelId(
+      kInvalidCameraId, PinholeCameraModel::model_id, 1000, 1000, 1000);
+  ImgFromCamFunc img_from_cam_func =
+      std::bind(&Camera::ImgFromCam, &camera, std::placeholders::_1);
+
+  double worst_rotation_error = 0;
+  double worst_translation_error = 0;
+  int num_trials = 0;
+
+  for (int trial = 0; trial < 2000; ++trial) {
+    const Eigen::Vector3d gravity_in_world =
+        Eigen::Vector3d::Random().normalized();
+    const Eigen::Vector3d axis = Eigen::Vector3d::Random().normalized();
+    const Eigen::Matrix3d R_gt(
+        Eigen::AngleAxisd(RandomUniformReal(-M_PI, M_PI), axis));
+    const Eigen::Vector3d gravity_in_cam = R_gt * gravity_in_world;
+    const Eigen::Vector3d t_gt = 5 * Eigen::Vector3d::Random();
+
+    std::vector<Eigen::Vector3d> points3D(2);
+    std::vector<Point2DWithRay> points2D(2);
+    bool in_front = true;
+    for (int i = 0; i < 2; ++i) {
+      points3D[i] = 3 * Eigen::Vector3d::Random();
+      const Eigen::Vector3d point_in_cam = R_gt * points3D[i] + t_gt;
+      if (point_in_cam.z() < 0.2) {
+        in_front = false;
+        break;
+      }
+      points2D[i].camera_ray = point_in_cam.normalized();
+      points2D[i].image_point =
+          camera.ImgFromCam(point_in_cam).value();
+    }
+    if (!in_front) continue;
+    ++num_trials;
+
+    const Up2PEstimator estimator(
+        img_from_cam_func, gravity_in_world, gravity_in_cam);
+    std::vector<Eigen::Matrix3x4d> models;
+    estimator.Estimate(points2D, points3D, &models);
+    ASSERT_FALSE(models.empty());
+
+    double best_rotation_error = std::numeric_limits<double>::max();
+    double best_translation_error = std::numeric_limits<double>::max();
+    for (const Eigen::Matrix3x4d& model : models) {
+      const double rotation_error = (model.leftCols<3>() - R_gt).norm();
+      if (rotation_error < best_rotation_error) {
+        best_rotation_error = rotation_error;
+        best_translation_error = (model.col(3) - t_gt).norm();
+      }
+    }
+    worst_rotation_error = std::max(worst_rotation_error, best_rotation_error);
+    worst_translation_error =
+        std::max(worst_translation_error, best_translation_error);
+  }
+
+  // Random configurations often put a point behind the camera; a few hundred
+  // surviving trials is ample for an exactness check.
+  EXPECT_GT(num_trials, 500);
+  EXPECT_LT(worst_rotation_error, 1e-6);
+  EXPECT_LT(worst_translation_error, 1e-6);
+}
+
+// The solver must reproduce P3P's answer on a well-conditioned configuration
+// while using one fewer correspondence.
+TEST(AbsolutePose, Up2PMatchesGroundTruthPose) {
+  Camera camera = Camera::CreateFromModelId(
+      kInvalidCameraId, PinholeCameraModel::model_id, 1000, 1000, 1000);
+  ImgFromCamFunc img_from_cam_func =
+      std::bind(&Camera::ImgFromCam, &camera, std::placeholders::_1);
+
+  const Eigen::Vector3d gravity_in_world(0, 1, 0);
+  const Eigen::Matrix3d R_gt(Eigen::AngleAxisd(0.3, gravity_in_world));
+  const Eigen::Vector3d t_gt(0.5, -0.2, 4.0);
+  const Eigen::Vector3d gravity_in_cam = R_gt * gravity_in_world;
+
+  const std::vector<Eigen::Vector3d> points3D = {Eigen::Vector3d(1, 1, 1),
+                                                 Eigen::Vector3d(-1, 0.5, 2)};
+  std::vector<Point2DWithRay> points2D(2);
+  for (int i = 0; i < 2; ++i) {
+    const Eigen::Vector3d point_in_cam = R_gt * points3D[i] + t_gt;
+    points2D[i].camera_ray = point_in_cam.normalized();
+    points2D[i].image_point =
+        camera.ImgFromCam(point_in_cam).value();
+  }
+
+  const Up2PEstimator estimator(
+      img_from_cam_func, gravity_in_world, gravity_in_cam);
+  std::vector<Eigen::Matrix3x4d> models;
+  estimator.Estimate(points2D, points3D, &models);
+  ASSERT_FALSE(models.empty());
+
+  bool found = false;
+  for (const Eigen::Matrix3x4d& model : models) {
+    if ((model.leftCols<3>() - R_gt).norm() < 1e-6 &&
+        (model.col(3) - t_gt).norm() < 1e-6) {
+      found = true;
+      // Residuals must be zero for the exact model.
+      std::vector<double> residuals;
+      estimator.Residuals(points2D, points3D, model, &residuals);
+      for (const double residual : residuals) {
+        EXPECT_LT(residual, 1e-12);
+      }
+    }
+  }
+  EXPECT_TRUE(found);
 }
 
 }  // namespace

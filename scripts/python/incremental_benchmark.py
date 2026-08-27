@@ -317,8 +317,8 @@ def main() -> int:
                     help="Cap the number of images (0 = all)")
     ap.add_argument(
         "--variants", default="full,window8",
-        help="Comma list: 'full' (window 0) and/or 'windowN[.M]' for "
-             "optimize_window_size N with full_solve_interval M")
+        help="Comma list: 'full' (window 0) and/or 'windowN' for "
+             "optimize_window_size N")
     args = ap.parse_args()
 
     args.output_dir.mkdir(parents=True, exist_ok=True)

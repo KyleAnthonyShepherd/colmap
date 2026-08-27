@@ -94,6 +94,21 @@ class IncrementalMapper {
     // Whether to estimate the extra parameters in absolute pose estimation.
     bool abs_pose_refine_extra_params = true;
 
+    // Optional known vertical (gravity) direction for absolute pose
+    // estimation. `gravity_in_world` is the direction in the reconstruction's
+    // world frame; `gravity_in_cam` maps an image id to the same physical
+    // direction in that image's camera frame (e.g. from an IMU pose prior).
+    // When both are available for an image, RegisterNextImage uses the
+    // 2-point upright solver instead of P3P. See
+    // AbsolutePoseEstimationOptions::gravity_in_world.
+    std::optional<Eigen::Vector3d> gravity_in_world;
+    std::unordered_map<image_t, Eigen::Vector3d> gravity_in_cam;
+
+    // Expected worst-case error of the gravity direction, in degrees. Kept
+    // small deliberately; see
+    // AbsolutePoseEstimationOptions::gravity_uncertainty_deg for why.
+    double gravity_uncertainty_deg = 0.5;
+
     // Number of images to optimize in local bundle adjustment.
     int ba_local_num_images = 6;
 

@@ -29,10 +29,16 @@
 
 #include "colmap/estimators/solvers/absolute_pose.h"
 
+#include "colmap/geometry/rigid3.h"
 #include "colmap/util/eigen_alignment.h"
 #include "colmap/util/logging.h"
 
+#include <algorithm>
+#include <array>
+#include <cmath>
+
 #include <Eigen/Geometry>
+#include <Eigen/SVD>
 #include <PoseLib/solvers/p3p.h>
 #include <PoseLib/solvers/p4pf.h>
 
@@ -68,6 +74,136 @@ void P3PEstimator::Residuals(const std::vector<X_t>& points2D,
                              const std::vector<Y_t>& points3D,
                              const M_t& cam_from_world,
                              std::vector<double>* residuals) const {
+  ComputeSquaredReprojectionError(
+      points2D, points3D, cam_from_world, img_from_cam_func_, residuals);
+}
+
+namespace {
+
+// Minimal rotation R with R * a = b, for unit vectors a and b.
+Eigen::Matrix3d RotationBetweenVectors(const Eigen::Vector3d& a,
+                                       const Eigen::Vector3d& b) {
+  const Eigen::Vector3d an = a.normalized();
+  const Eigen::Vector3d bn = b.normalized();
+  const Eigen::Vector3d v = an.cross(bn);
+  const double sin_angle = v.norm();
+  const double cos_angle = an.dot(bn);
+  if (sin_angle < 1e-12) {
+    if (cos_angle > 0) return Eigen::Matrix3d::Identity();
+    // Anti-parallel: rotate by pi about any axis perpendicular to a.
+    Eigen::Vector3d perp(1, 0, 0);
+    if (std::abs(an.x()) > 0.9) perp = Eigen::Vector3d(0, 1, 0);
+    const Eigen::Vector3d axis = an.cross(perp).normalized();
+    const Eigen::Matrix3d K = CrossProductMatrix(axis);
+    return Eigen::Matrix3d::Identity() + 2 * K * K;
+  }
+  const Eigen::Matrix3d K = CrossProductMatrix(v);
+  return Eigen::Matrix3d::Identity() + K +
+         K * K * ((1 - cos_angle) / (sin_angle * sin_angle));
+}
+
+}  // namespace
+
+Up2PEstimator::Up2PEstimator(ImgFromCamFunc img_from_cam_func,
+                             const Eigen::Vector3d& gravity_in_world,
+                             const Eigen::Vector3d& gravity_in_cam)
+    : img_from_cam_func_(std::move(THROW_CHECK_NOTNULL(img_from_cam_func))),
+      gravity_in_world_(gravity_in_world.normalized()),
+      align_from_world_(RotationBetweenVectors(gravity_in_world.normalized(),
+                                               gravity_in_cam.normalized())) {}
+
+void Up2PEstimator::Estimate(const std::vector<X_t>& points2D,
+                             const std::vector<Y_t>& points3D,
+                             std::vector<M_t>* cams_from_world) const {
+  THROW_CHECK_EQ(points2D.size(), 2);
+  THROW_CHECK_EQ(points3D.size(), 2);
+  THROW_CHECK_NOTNULL(cams_from_world);
+  cams_from_world->clear();
+
+  // Re-express each world point in the gravity-aligned basis so that, for the
+  // remaining yaw theta about the vertical,
+  //     R(theta) * X_i = A_i * cos(theta) + B_i * sin(theta) + C_i
+  // which makes the projection equations linear in (cos, sin, t).
+  Eigen::Matrix<double, 3, 2> A;
+  Eigen::Matrix<double, 3, 2> B;
+  Eigen::Matrix<double, 3, 2> C;
+  for (int i = 0; i < 2; ++i) {
+    const Eigen::Vector3d& X = points3D[i];
+    const Eigen::Vector3d c = gravity_in_world_ * gravity_in_world_.dot(X);
+    A.col(i) = align_from_world_ * (X - c);
+    B.col(i) = align_from_world_ * gravity_in_world_.cross(X);
+    C.col(i) = align_from_world_ * c;
+  }
+
+  // Each correspondence contributes [ray]_x * (A c + B s + t + C) = 0.
+  Eigen::Matrix<double, 6, 5> M;
+  Eigen::Matrix<double, 6, 1> rhs;
+  for (int i = 0; i < 2; ++i) {
+    const Eigen::Matrix3d skew = CrossProductMatrix(points2D[i].camera_ray);
+    M.block<3, 1>(3 * i, 0) = skew * A.col(i);
+    M.block<3, 1>(3 * i, 1) = skew * B.col(i);
+    M.block<3, 3>(3 * i, 2) = skew;
+    rhs.segment<3>(3 * i) = -skew * C.col(i);
+  }
+
+  // M has rank 4 for two correspondences, so the solutions form a line:
+  // a particular least-squares solution plus the one-dimensional null space.
+  const Eigen::JacobiSVD<Eigen::Matrix<double, 6, 5>> svd(
+      M, Eigen::ComputeFullU | Eigen::ComputeFullV);
+  const Eigen::Matrix<double, 5, 1> p0 = svd.solve(rhs);
+  const Eigen::Matrix<double, 5, 1> singular_values =
+      Eigen::Matrix<double, 5, 1>::Zero().cwiseMax(
+          svd.singularValues().head<5>());
+  if (singular_values(4) > 1e-9 * std::max(1.0, singular_values(0))) {
+    // Full rank: no free direction to intersect with the unit circle.
+    return;
+  }
+  const Eigen::Matrix<double, 5, 1> p1 = svd.matrixV().col(4);
+
+  // Intersect the line p0 + lambda * p1 with cos^2 + sin^2 = 1.
+  const double qa = p1(0) * p1(0) + p1(1) * p1(1);
+  const double qb = 2 * (p0(0) * p1(0) + p0(1) * p1(1));
+  const double qc = p0(0) * p0(0) + p0(1) * p0(1) - 1.0;
+
+  std::array<double, 2> lambdas;
+  int num_lambdas = 0;
+  if (std::abs(qa) < 1e-14) {
+    if (std::abs(qb) < 1e-14) return;
+    lambdas[num_lambdas++] = -qc / qb;
+  } else {
+    double disc = qb * qb - 4 * qa * qc;
+    if (disc < 0) {
+      if (disc > -1e-9) {
+        disc = 0.0;
+      } else {
+        return;
+      }
+    }
+    const double sq = std::sqrt(disc);
+    lambdas[num_lambdas++] = (-qb + sq) / (2 * qa);
+    lambdas[num_lambdas++] = (-qb - sq) / (2 * qa);
+  }
+
+  cams_from_world->reserve(num_lambdas);
+  for (int i = 0; i < num_lambdas; ++i) {
+    const Eigen::Matrix<double, 5, 1> sol = p0 + lambdas[i] * p1;
+    const double norm = std::hypot(sol(0), sol(1));
+    if (norm < 1e-9) continue;
+    const double cos_theta = sol(0) / norm;
+    const double sin_theta = sol(1) / norm;
+    const Eigen::Matrix3d yaw(
+        Eigen::AngleAxisd(std::atan2(sin_theta, cos_theta), gravity_in_world_));
+    M_t cam_from_world;
+    cam_from_world.leftCols<3>() = align_from_world_ * yaw;
+    cam_from_world.col(3) = sol.tail<3>();
+    cams_from_world->push_back(cam_from_world);
+  }
+}
+
+void Up2PEstimator::Residuals(const std::vector<X_t>& points2D,
+                              const std::vector<Y_t>& points3D,
+                              const M_t& cam_from_world,
+                              std::vector<double>* residuals) const {
   ComputeSquaredReprojectionError(
       points2D, points3D, cam_from_world, img_from_cam_func_, residuals);
 }

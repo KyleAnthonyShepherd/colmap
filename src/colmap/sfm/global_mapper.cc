@@ -11,6 +11,9 @@
 #include "colmap/sfm/rotation_utils.h"
 
 #include <algorithm>
+#include <memory>
+#include <set>
+#include <sstream>
 #include <type_traits>
 
 namespace colmap {
@@ -865,28 +868,7 @@ std::unordered_set<image_t> GlobalMapper::BootstrapNewImagePoses(
   std::unordered_map<image_t, Eigen::Vector3d> image_to_gravity;
   std::optional<Eigen::Vector3d> world_gravity;
   if (options.bootstrap_max_gravity_error_deg > 0) {
-    for (const PosePrior& pose_prior : database_cache_->PosePriors()) {
-      if (pose_prior.corr_data_id.sensor_id.type == SensorType::CAMERA &&
-          pose_prior.HasGravity()) {
-        image_to_gravity[pose_prior.corr_data_id.id] =
-            pose_prior.gravity.normalized();
-      }
-    }
-
-    Eigen::Vector3d world_gravity_sum = Eigen::Vector3d::Zero();
-    size_t num_prior_gravities = 0;
-    for (const image_t prior_id : prior_image_ids_) {
-      const auto it = image_to_gravity.find(prior_id);
-      if (it == image_to_gravity.end()) continue;
-      // g_world = R_cam_from_world^T * g_cam.
-      const Eigen::Quaterniond R_prior =
-          reconstruction_->Image(prior_id).CamFromWorld().rotation();
-      world_gravity_sum += R_prior.inverse() * it->second;
-      ++num_prior_gravities;
-    }
-    if (num_prior_gravities > 0 && world_gravity_sum.norm() > 1e-6) {
-      world_gravity = world_gravity_sum.normalized();
-    }
+    world_gravity = CollectGravityPriors(&image_to_gravity);
   }
 
   // Solve each new image's pose from its accumulated evidence.
@@ -946,13 +928,251 @@ std::unordered_set<image_t> GlobalMapper::BootstrapNewImagePoses(
   return bootstrapped;
 }
 
+// ── GlobalMapper::ImportPriorPoints3D ────────────────────────────────
+
+bool GlobalMapper::ImportPriorPoints3D(
+    const GlobalMapperOptions& options,
+    const class Reconstruction& prior_reconstruction,
+    IncrementalAddLedger* ledger) {
+  THROW_CHECK_NOTNULL(reconstruction_);
+
+  // 1. Import the prior 3D points, re-linking their 2D-3D associations.
+  //
+  //    On a healthy prior this import is *lossless*: every drop path below
+  //    signals that the prior reconstruction and the database disagree.
+  //    - missing image / bad point2D_idx: upstream corruption, the same
+  //      signal LoadPriorPoses already warns about;
+  //    - already linked: unreachable for a consistent prior, since we import
+  //      into an empty point set -- it needs two prior points claiming one
+  //      observation;
+  //    - short track: only ever a consequence of the three above.
+  //
+  //    So we count each reason separately and refuse to hide any of them. A
+  //    silent haircut here compounds across every subsequent add; failing the
+  //    add instead leaves the last good reconstruction in place.
+  IncrementalAddLedger local_ledger;
+  IncrementalAddLedger& acc = (ledger != nullptr) ? *ledger : local_ledger;
+  acc.prior_points_total = prior_reconstruction.NumPoints3D();
+
+  std::set<image_t> missing_image_ids;
+  std::set<image_t> bad_idx_image_ids;
+  for (const auto& [point3D_id, prior_point3D] :
+       prior_reconstruction.Points3D()) {
+    struct Point3D point3D;
+    point3D.xyz = prior_point3D.xyz;
+    point3D.color = prior_point3D.color;
+    point3D.error = prior_point3D.error;
+    for (const TrackElement& track_el : prior_point3D.track.Elements()) {
+      if (!reconstruction_->ExistsImage(track_el.image_id)) {
+        ++acc.dropped_missing_image;
+        missing_image_ids.insert(track_el.image_id);
+        continue;
+      }
+      const Image& image = reconstruction_->Image(track_el.image_id);
+      if (track_el.point2D_idx >= image.NumPoints2D()) {
+        ++acc.dropped_bad_point2D_idx;
+        bad_idx_image_ids.insert(track_el.image_id);
+        continue;
+      }
+      if (image.Point2D(track_el.point2D_idx).HasPoint3D()) {
+        ++acc.dropped_already_linked;
+        continue;
+      }
+      point3D.track.AddElement(track_el);
+    }
+    if (point3D.track.Length() < 2) {
+      ++acc.dropped_short_track;
+      continue;
+    }
+    reconstruction_->AddPoint3D(point3D_id, std::move(point3D));
+    ++acc.imported;
+  }
+
+  if (acc.DroppedAtImport() > 0) {
+    LOG(ERROR) << "ImportPriorPoints3D: prior structure import was "
+                  "lossy. This means the prior reconstruction and the "
+                  "database disagree; it is not normal wear.";
+    if (acc.dropped_missing_image > 0) {
+      std::ostringstream ids;
+      for (const image_t id : missing_image_ids) ids << ' ' << id;
+      LOG(ERROR) << "  " << acc.dropped_missing_image
+                 << " track element(s) reference image(s) missing from the "
+                    "database cache:"
+                 << ids.str();
+    }
+    if (acc.dropped_bad_point2D_idx > 0) {
+      std::ostringstream ids;
+      for (const image_t id : bad_idx_image_ids) ids << ' ' << id;
+      LOG(ERROR) << "  " << acc.dropped_bad_point2D_idx
+                 << " track element(s) have an out-of-range keypoint index; "
+                    "keypoints changed under the prior for image(s):"
+                 << ids.str();
+    }
+    if (acc.dropped_already_linked > 0) {
+      LOG(ERROR) << "  " << acc.dropped_already_linked
+                 << " track element(s) target a Point2D already claimed by "
+                    "another prior point (inconsistent prior).";
+    }
+    if (acc.dropped_short_track > 0) {
+      LOG(ERROR) << "  " << acc.dropped_short_track
+                 << " prior point(s) lost entirely (< 2 views left).";
+    }
+    if (!options.allow_lossy_prior_import) {
+      LOG(ERROR) << "Failing this add rather than writing a degraded model. "
+                    "Pass --allow_lossy_prior_import to import anyway.";
+      return false;
+    }
+    LOG(WARNING) << "allow_lossy_prior_import is set; continuing with "
+                 << acc.imported << " of " << acc.prior_points_total
+                 << " prior point(s).";
+  }
+
+  LOG(INFO) << "ImportPriorPoints3D: imported " << acc.imported << " of "
+            << acc.prior_points_total << " prior 3D point(s).";
+  return true;
+}
+
+// ── GlobalMapper::CollectGravityPriors ─────────────────────────
+
+std::optional<Eigen::Vector3d> GlobalMapper::CollectGravityPriors(
+    std::unordered_map<image_t, Eigen::Vector3d>* image_to_gravity) const {
+  THROW_CHECK_NOTNULL(image_to_gravity);
+  image_to_gravity->clear();
+
+  for (const PosePrior& pose_prior : database_cache_->PosePriors()) {
+    if (pose_prior.corr_data_id.sensor_id.type == SensorType::CAMERA &&
+        pose_prior.HasGravity()) {
+      (*image_to_gravity)[pose_prior.corr_data_id.id] =
+          pose_prior.gravity.normalized();
+    }
+  }
+
+  // Average the prior images' measured gravity, rotated into the world frame
+  // by their known poses: g_world = R_cam_from_world^T * g_cam.
+  Eigen::Vector3d world_gravity_sum = Eigen::Vector3d::Zero();
+  size_t num_prior_gravities = 0;
+  for (const image_t prior_id : prior_image_ids_) {
+    const auto it = image_to_gravity->find(prior_id);
+    if (it == image_to_gravity->end()) continue;
+    if (!reconstruction_->ExistsImage(prior_id)) continue;
+    if (!reconstruction_->Image(prior_id).HasPose()) continue;
+    const Eigen::Quaterniond R_prior =
+        reconstruction_->Image(prior_id).CamFromWorld().rotation();
+    world_gravity_sum += R_prior.inverse() * it->second;
+    ++num_prior_gravities;
+  }
+  if (num_prior_gravities > 0 && world_gravity_sum.norm() > 1e-6) {
+    return world_gravity_sum.normalized();
+  }
+  return std::nullopt;
+}
+
+// ── GlobalMapper::RegisterNewImagesByPnP ────────────────────────
+
+std::unordered_set<image_t> GlobalMapper::RegisterNewImagesByPnP(
+    const GlobalMapperOptions& options, IncrementalAddLedger* ledger) {
+  THROW_CHECK_NOTNULL(reconstruction_);
+
+  std::unordered_set<image_t> registered;
+
+  if (reconstruction_->NumPoints3D() == 0) {
+    LOG(WARNING) << "RegisterNewImagesByPnP: no prior structure imported; "
+                    "nothing to match against. Falling back to bootstrap.";
+    return registered;
+  }
+
+  // Sorted for determinism: RegisterNextImage mutates the model (it adds the
+  // inlier observations), so registration order is observable.
+  std::vector<image_t> candidates;
+  for (const auto& [image_id, image] : reconstruction_->Images()) {
+    if (!image.HasPose()) candidates.push_back(image_id);
+  }
+  std::sort(candidates.begin(), candidates.end());
+  if (candidates.empty()) return registered;
+
+  // TearDown() (called by EndReconstruction) erases every image without a
+  // pose, which is exactly the set the bootstrap fallback still needs, and
+  // can also drop cameras belonging to rigs left with no registered frame.
+  // Snapshot the refined intrinsics so a re-Load cannot quietly replace them
+  // with the database's coarse values.
+  std::unordered_map<camera_t, struct Camera> camera_snapshot;
+  for (const auto& [camera_id, camera] : reconstruction_->Cameras()) {
+    camera_snapshot.emplace(camera_id, camera);
+  }
+
+  IncrementalMapper mapper(database_cache_);
+  mapper.BeginReconstruction(reconstruction_);
+
+  IncrementalMapper::Options mapper_options;
+  mapper_options.num_threads = options.num_threads;
+  mapper_options.random_seed = options.random_seed;
+  // Never let a single-view PnP move the shared camera's intrinsics. The
+  // incremental path imports the prior's bundle-adjusted intrinsics, which
+  // are estimated from the whole model; re-fitting them against one image's
+  // correspondences would be strictly worse information.
+  mapper_options.abs_pose_refine_focal_length = false;
+  mapper_options.abs_pose_refine_extra_params = false;
+  mapper_options.abs_pose_min_num_inliers = options.pnp_min_num_inliers;
+
+  // Supply the known vertical, when the database carries gravity priors, so
+  // absolute pose estimation can use the 2-point upright solver: 4 unknowns
+  // instead of 6 means the few correspondences a weakly-connected image has
+  // constrain the pose far more tightly. RefineAbsolutePose still polishes
+  // without the constraint, so IMU error does not enter the output pose.
+  std::unordered_map<image_t, Eigen::Vector3d> image_to_gravity;
+  mapper_options.gravity_in_world = CollectGravityPriors(&image_to_gravity);
+  mapper_options.gravity_uncertainty_deg = options.gravity_uncertainty_deg;
+  if (mapper_options.gravity_in_world.has_value()) {
+    mapper_options.gravity_in_cam = std::move(image_to_gravity);
+    LOG(INFO) << "RegisterNewImagesByPnP: using gravity-constrained absolute "
+                 "pose (up2p) with "
+              << mapper_options.gravity_in_cam.size()
+              << " image gravity prior(s).";
+  }
+
+  for (const image_t image_id : candidates) {
+    const std::string& name = reconstruction_->Image(image_id).Name();
+    if (mapper.RegisterNextImage(mapper_options, image_id)) {
+      registered.insert(image_id);
+      LOG(INFO) << "RegisterNewImagesByPnP: registered image " << image_id
+                << " ('" << name << "') with "
+                << reconstruction_->Image(image_id).NumPoints3D()
+                << " observation(s).";
+    } else {
+      // Not an error: declining is the point. A weakly-connected image gets
+      // handed to the bootstrap rather than being given a guessed pose.
+      LOG(WARNING) << "RegisterNewImagesByPnP: absolute pose estimation "
+                      "declined image "
+                   << image_id << " ('" << name
+                   << "'); leaving it for the bootstrap fallback.";
+    }
+  }
+  mapper.EndReconstruction(/*discard=*/false);
+
+  // Restore the images TearDown removed, then the refined intrinsics.
+  reconstruction_->Load(*database_cache_);
+  for (const auto& [camera_id, camera] : camera_snapshot) {
+    if (reconstruction_->ExistsCamera(camera_id)) {
+      reconstruction_->Camera(camera_id).params = camera.params;
+    }
+  }
+
+  if (ledger != nullptr) {
+    ledger->pnp_registered += registered.size();
+  }
+  LOG(INFO) << "RegisterNewImagesByPnP: registered " << registered.size()
+            << " of " << candidates.size() << " new image(s) by PnP.";
+  return registered;
+}
+
 // ── GlobalMapper::SolveIncrementalWindowed ─────────────────────────────────
 
 bool GlobalMapper::SolveIncrementalWindowed(
     const GlobalMapperOptions& options,
     const class Reconstruction& prior_reconstruction,
     const std::unordered_set<image_t>& new_image_ids,
-    const std::unordered_set<image_t>& constant_image_ids) {
+    const std::unordered_set<image_t>& constant_image_ids,
+    IncrementalAddLedger* ledger) {
   THROW_CHECK_NOTNULL(reconstruction_);
   THROW_CHECK_GT(options.optimize_window_size, 0);
   THROW_CHECK(!new_image_ids.empty());
@@ -1004,34 +1224,16 @@ bool GlobalMapper::SolveIncrementalWindowed(
               << donor->MeanFocalLength() << ").";
   }
 
-  // 1. Import the prior 3D points, re-linking their 2D-3D associations.
-  //    Track elements referencing images or keypoints missing from the
-  //    database cache are dropped (with the same corruption caveat as
-  //    LoadPriorPoses); tracks shorter than 2 views afterwards are skipped.
-  size_t num_imported = 0;
-  size_t num_skipped = 0;
-  for (const auto& [point3D_id, prior_point3D] :
-       prior_reconstruction.Points3D()) {
-    struct Point3D point3D;
-    point3D.xyz = prior_point3D.xyz;
-    point3D.color = prior_point3D.color;
-    point3D.error = prior_point3D.error;
-    for (const TrackElement& track_el : prior_point3D.track.Elements()) {
-      if (!reconstruction_->ExistsImage(track_el.image_id)) continue;
-      const Image& image = reconstruction_->Image(track_el.image_id);
-      if (track_el.point2D_idx >= image.NumPoints2D()) continue;
-      if (image.Point2D(track_el.point2D_idx).HasPoint3D()) continue;
-      point3D.track.AddElement(track_el);
+  // 1. Import the prior 3D points (unless a caller already did, e.g. to
+  //    give PnP registration something to match against).
+  IncrementalAddLedger local_ledger;
+  IncrementalAddLedger& acc = (ledger != nullptr) ? *ledger : local_ledger;
+  if (reconstruction_->NumPoints3D() == 0) {
+    if (!ImportPriorPoints3D(options, prior_reconstruction, &acc)) {
+      return false;
     }
-    if (point3D.track.Length() < 2) {
-      ++num_skipped;
-      continue;
-    }
-    reconstruction_->AddPoint3D(point3D_id, std::move(point3D));
-    ++num_imported;
   }
-  LOG(INFO) << "SolveIncrementalWindowed: imported " << num_imported
-            << " prior 3D point(s), skipped " << num_skipped << ".";
+
 
   // 2. Triangulate the new image(s) against the prior structure and run
   //    iterative local bundle adjustment with a covisibility window. Poses
@@ -1059,12 +1261,11 @@ bool GlobalMapper::SolveIncrementalWindowed(
 
   IncrementalTriangulator::Options tri_options = opts.retriangulation;
 
-  size_t num_triangulated = 0;
   for (const image_t image_id : new_image_ids) {
     THROW_CHECK(reconstruction_->Image(image_id).HasPose())
         << "New image " << image_id << " must be bootstrapped before the "
         << "windowed solve.";
-    num_triangulated += mapper.TriangulateImage(tri_options, image_id);
+    acc.triangulated += mapper.TriangulateImage(tri_options, image_id);
     mapper.IterativeLocalRefinement(/*max_num_refinements=*/2,
                                     /*max_refinement_change=*/0.001,
                                     mapper_options,
@@ -1072,13 +1273,120 @@ bool GlobalMapper::SolveIncrementalWindowed(
                                     tri_options,
                                     image_id);
   }
+
+  // Recover observations that local filtering stripped from prior points on
+  // this or an earlier add. A filtered observation is not destroyed -- the
+  // feature match is still in the database -- so it can be re-attached now
+  // that the poses have been refined. IterativeLocalRefinement only completes
+  // the *modified* points; this sweeps all of them, which is cheap and is
+  // what stops a drip-fed session from bleeding structure.
+  acc.completed += mapper.CompleteTracks(tri_options);
+  acc.merged += mapper.MergeTracks(tri_options);
+
   mapper.EndReconstruction(/*discard=*/false);
 
-  LOG(INFO) << "SolveIncrementalWindowed: triangulated " << num_triangulated
+  acc.points_out = reconstruction_->NumPoints3D();
+  acc.mean_reproj_error = reconstruction_->ComputeMeanReprojectionError();
+  acc.mean_track_length = reconstruction_->ComputeMeanTrackLength();
+
+  LOG(INFO) << "SolveIncrementalWindowed: triangulated " << acc.triangulated
             << " observation(s) for " << new_image_ids.size()
-            << " new image(s); window size " << opts.optimize_window_size
+            << " new image(s); completed " << acc.completed << ", merged "
+            << acc.merged << "; " << acc.points_out
+            << " point(s) out; window size " << opts.optimize_window_size
             << ".";
   return true;
+}
+
+// ── GlobalMapper::RefreshIntrinsicsGlobally ────────────────────────────────
+
+size_t GlobalMapper::RefreshIntrinsicsGlobally(
+    const GlobalMapperOptions& options, IncrementalAddLedger* ledger) {
+  THROW_CHECK_NOTNULL(reconstruction_);
+
+  const GlobalMapperOptions opts = InitializeOptions(options);
+  const std::vector<image_t> reg_image_ids = reconstruction_->RegImageIds();
+  if (reg_image_ids.empty()) return 0;
+
+  // 1. Intrinsics-only global bundle adjustment.
+  //
+  //    Everything except the camera parameters is held constant, so this is
+  //    a ~4-8 DOF problem no matter how large N grows: the cost is residual
+  //    evaluation, not the Schur complement. The gauge is fixed by
+  //    construction (all poses and points constant), so no gauge fixing is
+  //    needed or wanted.
+  BundleAdjustmentConfig ba_config;
+  for (const image_t image_id : reg_image_ids) {
+    ba_config.AddImage(image_id);
+  }
+
+  BundleAdjustmentOptions ba_options = opts.bundle_adjustment;
+  ba_options.refine_points3D = false;
+  ba_options.refine_rig_from_world = false;
+  ba_options.refine_sensor_from_rig = false;
+  ba_options.refine_focal_length = true;
+  ba_options.refine_extra_params = true;
+  ba_options.print_summary = false;
+  if (ba_options.ceres) {
+    ba_options.ceres->solver_options.num_threads = opts.num_threads;
+  }
+
+  const double before_error = reconstruction_->ComputeMeanReprojectionError();
+  std::vector<double> before_focals;
+  for (const auto& [camera_id, camera] : reconstruction_->Cameras()) {
+    before_focals.push_back(camera.MeanFocalLength());
+  }
+
+  std::unique_ptr<BundleAdjuster> bundle_adjuster =
+      CreateDefaultBundleAdjuster(ba_options, ba_config, *reconstruction_);
+  bundle_adjuster->Solve();
+
+  std::ostringstream focal_change;
+  size_t focal_idx = 0;
+  for (const auto& [camera_id, camera] : reconstruction_->Cameras()) {
+    focal_change << " cam" << camera_id << ": " << before_focals[focal_idx++]
+                 << " -> " << camera.MeanFocalLength();
+  }
+  LOG(INFO) << "RefreshIntrinsicsGlobally: intrinsics-only BA over "
+            << reg_image_ids.size() << " image(s);" << focal_change.str();
+
+  // 2. Recover structure that was filtered away while the intrinsics were
+  //    wrong. This is the operation that only becomes possible once the
+  //    global parameter is corrected, which is why it is paired with the BA
+  //    rather than run on its own schedule.
+  const size_t points_before = reconstruction_->NumPoints3D();
+  const size_t obs_before = reconstruction_->ComputeNumObservations();
+
+  IncrementalMapper mapper(database_cache_);
+  mapper.BeginReconstruction(reconstruction_);
+  const IncrementalTriangulator::Options tri_options = opts.retriangulation;
+  const size_t num_retriangulated = mapper.Retriangulate(tri_options);
+  const size_t num_completed = mapper.CompleteTracks(tri_options);
+  const size_t num_merged = mapper.MergeTracks(tri_options);
+  mapper.EndReconstruction(/*discard=*/false);
+
+  const size_t obs_after = reconstruction_->ComputeNumObservations();
+  const size_t recovered =
+      (obs_after > obs_before) ? (obs_after - obs_before) : 0;
+
+  LOG(INFO) << "RefreshIntrinsicsGlobally: mean reproj error " << before_error
+            << " -> " << reconstruction_->ComputeMeanReprojectionError()
+            << "; points " << points_before << " -> "
+            << reconstruction_->NumPoints3D() << "; retriangulated "
+            << num_retriangulated << ", completed " << num_completed
+            << ", merged " << num_merged << "; " << recovered
+            << " observation(s) recovered.";
+
+  if (ledger != nullptr) {
+    ledger->recovered += recovered;
+    ledger->completed += num_completed;
+    ledger->merged += num_merged;
+    ledger->intrinsics_refreshed = true;
+    ledger->points_out = reconstruction_->NumPoints3D();
+    ledger->mean_reproj_error = reconstruction_->ComputeMeanReprojectionError();
+    ledger->mean_track_length = reconstruction_->ComputeMeanTrackLength();
+  }
+  return recovered;
 }
 
 }  // namespace colmap

@@ -108,6 +108,13 @@ class GlobalPositioner {
   // cam_from_world convention.
   std::unordered_map<frame_t, Eigen::Vector3d> frame_centers_;
 
+  // Center and half-extent of the initialized frame centers, used to draw
+  // random point positions in the same box as the cameras. When positions come
+  // from a prior reconstruction, that box is the real scene scale rather than
+  // the fixed 200^3 cube.
+  Eigen::Vector3d position_box_center_ = Eigen::Vector3d::Zero();
+  double position_box_radius_ = 100.0;
+
   // Temporary storage for camera-in-rig positions when cam_from_rig is unknown
   // and needs to be estimated.
   std::unordered_map<sensor_t, Eigen::Vector3d> cams_in_rig_;

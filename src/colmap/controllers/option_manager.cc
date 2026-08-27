@@ -717,6 +717,14 @@ void OptionManager::AddGlobalMapperOptions() {
                    &global_mapper->mapper.track_min_num_views_per_track);
 
   // Global positioning options.
+  AddDefaultOption(
+      "GlobalMapper.gp_generate_random_positions",
+      &global_mapper->mapper.global_positioning.generate_random_positions);
+  AddDefaultOption(
+      "GlobalMapper.gp_generate_random_points",
+      &global_mapper->mapper.global_positioning.generate_random_points);
+  AddDefaultOption("GlobalMapper.gp_generate_scales",
+                   &global_mapper->mapper.global_positioning.generate_scales);
   AddDefaultOption("GlobalMapper.gp_use_gpu",
                    &global_mapper->mapper.global_positioning.use_gpu);
   AddDefaultOption("GlobalMapper.gp_gpu_index",

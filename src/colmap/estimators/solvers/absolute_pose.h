@@ -92,6 +92,73 @@ class P3PEstimator {
   const ImgFromCamFunc img_from_cam_func_;
 };
 
+// Minimal solver for absolute pose with a KNOWN VERTICAL (gravity) direction.
+//
+// A known "up" fixes 2 of the 3 rotation DOF, leaving one yaw angle plus the
+// 3-DOF translation -- 4 unknowns, solvable from 2 correspondences instead of
+// P3P's 3. Two properties matter for incremental mapping:
+//
+//   * RANSAC needs log(1-conf)/log(1-w^s) draws to see one clean minimal
+//     sample, so dropping s from 3 to 2 shrinks the budget sharply at low
+//     inlier ratios (at w=0.1, ~1.1k draws instead of ~11.5k -- and COLMAP's
+//     default max_num_trials is 10k, i.e. P3P can silently run out).
+//   * With 4 unknowns instead of 6, a given number of inliers constrains the
+//     pose better. This is the property that matters for a weakly-connected
+//     image, which may only have a few dozen correspondences in total.
+//
+// Based on:
+//
+//    Kukelova, Bujnak, Pajdla. "Closed-Form Solutions to Minimal Absolute
+//    Pose Problems with Known Vertical Direction." ACCV 2010.
+//    Sweeney et al. "Efficient Computation of Absolute Pose for
+//    Gravity-Aware Augmented Reality." ISMAR 2015.
+//
+// The gravity direction is expected to be imperfect (a phone IMU reading is
+// good to a degree or so). This solver therefore only *constrains the search*;
+// the caller is expected to polish the winning model with an unconstrained
+// refinement (RefineAbsolutePose) so IMU error is never baked into the output.
+// A hypothesis that exactly satisfies a slightly-wrong gravity direction is
+// systematically biased by roughly focal_length * tan(gravity_error), which is
+// tens of pixels for a degree or two, so the RANSAC inlier threshold must be
+// widened to match or correct correspondences get rejected.
+class Up2PEstimator {
+ public:
+  // The 2D image feature observations.
+  using X_t = Point2DWithRay;
+  // The observed 3D features in the world frame.
+  using Y_t = Eigen::Vector3d;
+  // The transformation from the world to the camera frame.
+  using M_t = Eigen::Matrix3x4d;
+
+  // The minimum number of samples needed to estimate a model.
+  static const int kMinNumSamples = 2;
+
+  // `gravity_in_world` and `gravity_in_cam` are the same physical direction
+  // expressed in the world frame and in the camera frame respectively. They
+  // need not be unit norm; they are normalized internally.
+  Up2PEstimator(ImgFromCamFunc img_from_cam_func,
+                const Eigen::Vector3d& gravity_in_world,
+                const Eigen::Vector3d& gravity_in_cam);
+
+  // Estimate up to two poses from two 2D-3D correspondences.
+  void Estimate(const std::vector<X_t>& points2D,
+                const std::vector<Y_t>& points3D,
+                std::vector<M_t>* cams_from_world) const;
+
+  // Squared reprojection error, in pixels, as for P3PEstimator.
+  void Residuals(const std::vector<X_t>& points2D,
+                 const std::vector<Y_t>& points3D,
+                 const M_t& cam_from_world,
+                 std::vector<double>* residuals) const;
+
+ private:
+  const ImgFromCamFunc img_from_cam_func_;
+  // Unit gravity in the world frame; the yaw axis.
+  Eigen::Vector3d gravity_in_world_;
+  // Minimal rotation taking gravity_in_world_ to gravity_in_cam_.
+  Eigen::Matrix3d align_from_world_;
+};
+
 // Minimal solver for 6-DOF pose and focal length.
 class P4PFEstimator {
  public:

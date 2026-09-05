@@ -15,7 +15,8 @@ void BindUtilTypes(py::module& m) {
   auto PySensorType = py::enum_<SensorType>(m, "SensorType")
                           .value("INVALID", SensorType::INVALID)
                           .value("CAMERA", SensorType::CAMERA)
-                          .value("IMU", SensorType::IMU);
+                          .value("IMU", SensorType::IMU)
+                          .value("GNSS", SensorType::GNSS);
   AddStringToEnumConstructor(PySensorType);
 
   auto PySensorT = py::classh<sensor_t>(m, "sensor_t")

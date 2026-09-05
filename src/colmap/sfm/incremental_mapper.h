@@ -169,6 +169,43 @@ class IncrementalMapper {
     // (chi2 for 3DOF at 95% = 7.815)
     double prior_position_loss_scale = 7.815;
 
+    // Standard deviation, in metres, assumed for priors that carry no
+    // covariance of their own. The site pipeline writes real per-frame
+    // covariance, so this should never be reached there -- and it must not be
+    // applied silently, because a 1 m default throws away a 1.6 cm vertical
+    // measurement.
+    double prior_position_fallback_stddev = 1.0;
+
+    // ── Position priors in the reconstruction's own world frame ───────────
+    //
+    // Optional, keyed by image id, and expressed in the *reconstruction's*
+    // world frame rather than the database's metric frame (see
+    // sfm/prior_positions.h for why the priors are moved rather than the
+    // model). When non-empty and `use_prior_position` is set, they:
+    //
+    //   * gate absolute-pose registration -- a PnP solution that disagrees
+    //     with its prior is declined rather than admitted and then left to
+    //     displace every later frame (this is what an 8-sigma blunder looks
+    //     like: 1.238 m of camera motion where the operator walked 0.297 m);
+    //   * enter local bundle adjustment as position residuals on the images
+    //     the window leaves free.
+    //
+    // Left empty, nothing changes: the cold `pose_prior_mapper` path keeps
+    // using `database_cache_->PosePriors()` in global bundle adjustment.
+    std::unordered_map<image_t, struct PosePrior> pose_priors_in_world;
+
+    // Absolute-pose acceptance gate. A registration is declined when its
+    // camera centre is further from the prior than BOTH
+    // `prior_position_max_error_sigma` sigmas (Mahalanobis, under the prior's
+    // own covariance) AND `prior_position_max_error_m` metres.
+    //
+    // Both conditions together, deliberately: the sigma test alone would
+    // reject on a 1.6 cm vertical sigma for a disagreement well inside normal
+    // SfM noise, and the metric test alone has no idea how good the fix is.
+    // <= 0 on the sigma disables the gate.
+    double prior_position_max_error_sigma = 5.0;
+    double prior_position_max_error_m = 0.1;
+
     // Number of threads.
     int num_threads = -1;
 
@@ -330,6 +367,14 @@ class IncrementalMapper {
   // Clear the collection of changed 3D points.
   void ClearModifiedPoints3D();
 
+  // Images whose pose was left free AND constrained by a position prior in a
+  // local bundle adjustment since this mapper was constructed. This is what
+  // the per-image residual report means by `used_in_ba`: the prior actually
+  // pulled on this pose rather than merely existing.
+  const std::unordered_set<image_t>& PriorConstrainedImageIds() const {
+    return prior_constrained_image_ids_;
+  }
+
   // Estimate two view geometry and checks if it is suitable for initialization.
   bool EstimateInitialTwoViewGeometry(const Options& options,
                                       image_t image_id1,
@@ -343,6 +388,14 @@ class IncrementalMapper {
                                        image_t image_id) const;
 
  private:
+  // Position-prior acceptance gate for absolute pose registration. Returns
+  // true when no gate is configured, when the image has no prior, or when the
+  // candidate pose agrees with it; false when the pose should be declined.
+  // See Options::prior_position_max_error_sigma.
+  bool CheckPriorPosition(const Options& options,
+                          image_t image_id,
+                          const Rigid3d& cam_from_world) const;
+
   struct RegistrationStatistics {
     // Number of images that are registered in at least one reconstruction.
     size_t num_total_reg_images = 0;
@@ -402,6 +455,10 @@ class IncrementalMapper {
   // This frame list will be non-empty, if the reconstruction is continued from
   // an existing reconstruction.
   std::unordered_set<frame_t> existing_frame_ids_;
+
+  // Images that received a position-prior residual on a free pose in a local
+  // bundle adjustment. See PriorConstrainedImageIds().
+  std::unordered_set<image_t> prior_constrained_image_ids_;
 };
 
 }  // namespace colmap

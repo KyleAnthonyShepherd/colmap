@@ -35,8 +35,10 @@
 #include "colmap/estimators/triangulation.h"
 #include "colmap/scene/reconstruction_pruning.h"
 #include "colmap/sfm/incremental_mapper_impl.h"
+#include "colmap/sfm/prior_positions.h"
 
 #include <array>
+#include <cmath>
 
 namespace colmap {
 
@@ -62,6 +64,9 @@ bool IncrementalMapper::Options::Check() const {
   CHECK_OPTION_GE(max_reg_trials, 1);
   CHECK_OPTION_GE(num_threads, -1);
   CHECK_OPTION_GE(random_seed, -1);
+  CHECK_OPTION_GT(prior_position_loss_scale, 0.0);
+  CHECK_OPTION_GT(prior_position_fallback_stddev, 0.0);
+  CHECK_OPTION_GE(prior_position_max_error_m, 0.0);
   return true;
 }
 
@@ -182,6 +187,50 @@ void IncrementalMapper::RegisterInitialImagePair(
   RegisterFrameEvent(image1.FrameId());
   obs_manager_->RegisterFrame(image2.FrameId());
   RegisterFrameEvent(image2.FrameId());
+}
+
+bool IncrementalMapper::CheckPriorPosition(
+    const Options& options,
+    const image_t image_id,
+    const Rigid3d& cam_from_world) const {
+  if (!options.use_prior_position || options.pose_priors_in_world.empty() ||
+      options.prior_position_max_error_sigma <= 0) {
+    return true;
+  }
+
+  const auto it = options.pose_priors_in_world.find(image_id);
+  if (it == options.pose_priors_in_world.end() || !it->second.HasPosition()) {
+    return true;
+  }
+  const PosePrior& prior = it->second;
+
+  const double fallback_stddev = options.prior_position_fallback_stddev;
+  const Eigen::Vector3d center = cam_from_world.TgtOriginInSrc();
+  const Eigen::Vector3d residual = center - prior.position;
+  const double residual_norm = residual.norm();
+  const Eigen::Matrix3d covariance =
+      prior.HasPositionCov()
+          ? prior.position_covariance
+          : (fallback_stddev * fallback_stddev) * Eigen::Matrix3d::Identity();
+  const double sigmas = std::sqrt(std::max(
+      0.0,
+      SquaredMahalanobisDistance(covariance, residual, fallback_stddev)));
+
+  if (sigmas > options.prior_position_max_error_sigma &&
+      residual_norm > options.prior_position_max_error_m) {
+    LOG(WARNING) << "Absolute pose for image " << image_id
+                 << " disagrees with its position prior by " << residual_norm
+                 << " m (" << sigmas << " sigma, limits "
+                 << options.prior_position_max_error_sigma << " sigma and "
+                 << options.prior_position_max_error_m
+                 << " m); declining the registration.";
+    return false;
+  }
+
+  VLOG(2) << "Absolute pose for image " << image_id
+          << " agrees with its position prior to " << residual_norm << " m ("
+          << sigmas << " sigma).";
+  return true;
 }
 
 bool IncrementalMapper::RegisterNextImage(const Options& options,
@@ -421,6 +470,21 @@ bool IncrementalMapper::RegisterNextImage(const Options& options,
   }
 
   //////////////////////////////////////////////////////////////////////////////
+  // Position prior acceptance gate
+  //////////////////////////////////////////////////////////////////////////////
+
+  // Applied here, before anything is committed, rather than left to bundle
+  // adjustment. A pose that is admitted and only optimized afterwards has
+  // already displaced its successors -- every later image is registered
+  // against structure this one helped place -- and no amount of subsequent
+  // optimization undoes that ordering. Returning false leaves the image
+  // unregistered and retriable on a later add, which is strictly better than
+  // a confident wrong pose. See plan-6 item 1.
+  if (!CheckPriorPosition(options, image_id, cam_from_world)) {
+    return false;
+  }
+
+  //////////////////////////////////////////////////////////////////////////////
   // Continue tracks
   //////////////////////////////////////////////////////////////////////////////
 
@@ -596,6 +660,23 @@ bool IncrementalMapper::RegisterNextGeneralFrame(const Options& options,
                                      &cameras)) {
     VLOG(2) << "Absolute pose refinement failed";
     return false;
+  }
+
+  //////////////////////////////////////////////////////////////////////////////
+  // Position prior acceptance gate
+  //////////////////////////////////////////////////////////////////////////////
+
+  // Same gate as the trivial-frame path, applied to every camera of the rig:
+  // the frame is accepted only if no sensor's implied centre contradicts its
+  // prior. See CheckPriorPosition and plan-6 item 1.
+  for (const data_t& data_id : frame.ImageIds()) {
+    const Rigid3d cam_from_world =
+        frame.RigPtr()->IsRefSensor(data_id.sensor_id)
+            ? rig_from_world
+            : frame.RigPtr()->SensorFromRig(data_id.sensor_id) * rig_from_world;
+    if (!CheckPriorPosition(options, data_id.id, cam_from_world)) {
+      return false;
+    }
   }
 
   //////////////////////////////////////////////////////////////////////////////
@@ -1041,8 +1122,59 @@ IncrementalMapper::AdjustLocalBundle(
 
     // Adjust the local bundle.
     image_ids = ba_config.Images();
-    std::unique_ptr<BundleAdjuster> bundle_adjuster =
-        CreateDefaultBundleAdjuster(ba_options, ba_config, *reconstruction_);
+
+    // Position priors, when supplied in the reconstruction's own world frame,
+    // constrain the images the window leaves free. This is the windowed
+    // counterpart of what AdjustGlobalBundle already does for the cold
+    // `pose_prior_mapper` path -- without it a live walk has no way to use
+    // GNSS at all, which is the capability gap plan-6 item 1 is about.
+    //
+    // Alignment is deliberately disabled: PosePriorBundleAdjuster's own
+    // alignment + normalization would move the whole reconstruction, and an
+    // incremental add must stay in the prior model's gauge. The priors were
+    // brought into that gauge instead (see sfm/prior_positions.h).
+    std::vector<PosePrior> local_pose_priors;
+    if (options.use_prior_position && !options.pose_priors_in_world.empty()) {
+      for (const image_t local_image_id : image_ids) {
+        const auto prior_it =
+            options.pose_priors_in_world.find(local_image_id);
+        if (prior_it == options.pose_priors_in_world.end() ||
+            !prior_it->second.HasPosition()) {
+          continue;
+        }
+        const Image& local_image = reconstruction_->Image(local_image_id);
+        if (ba_config.HasConstantRigFromWorldPose(local_image.FrameId())) {
+          continue;
+        }
+        local_pose_priors.push_back(prior_it->second);
+        prior_constrained_image_ids_.insert(local_image_id);
+      }
+    }
+
+    std::unique_ptr<BundleAdjuster> bundle_adjuster;
+    if (local_pose_priors.empty()) {
+      bundle_adjuster =
+          CreateDefaultBundleAdjuster(ba_options, ba_config, *reconstruction_);
+    } else {
+      PosePriorBundleAdjustmentOptions prior_options;
+      prior_options.align_reconstruction_to_priors = false;
+      prior_options.prior_position_fallback_stddev =
+          options.prior_position_fallback_stddev;
+      if (options.use_robust_loss_on_prior_position &&
+          prior_options.ceres != nullptr) {
+        prior_options.ceres->prior_position_loss_function_type =
+            CeresBundleAdjustmentOptions::LossFunctionType::CAUCHY;
+      }
+      if (prior_options.ceres != nullptr) {
+        prior_options.ceres->prior_position_loss_scale =
+            options.prior_position_loss_scale;
+      }
+      bundle_adjuster = CreatePosePriorBundleAdjuster(ba_options,
+                                                      prior_options,
+                                                      ba_config,
+                                                      local_pose_priors,
+                                                      *reconstruction_);
+    }
     const auto summary = bundle_adjuster->Solve();
 
     report.num_adjusted_observations = summary->num_residuals / 2;

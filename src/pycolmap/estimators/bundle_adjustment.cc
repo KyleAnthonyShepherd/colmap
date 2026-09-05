@@ -311,6 +311,14 @@ void BindBundleAdjuster(py::module& m) {
               "prior_position_fallback_stddev",
               &PosePriorBAOpts::prior_position_fallback_stddev,
               "Fallback if no prior position covariance is provided.")
+          .def_readwrite(
+              "align_reconstruction_to_priors",
+              &PosePriorBAOpts::align_reconstruction_to_priors,
+              "Whether to align and normalize the reconstruction to the pose "
+              "priors before adding the prior residuals. Set false when the "
+              "reconstruction is already in the priors' frame and must stay "
+              "there (incremental/windowed adds); the caller then owns the "
+              "gauge.")
           .def_readwrite("alignment_ransac",
                          &PosePriorBAOpts::alignment_ransac_options,
                          "RANSAC options for Sim3 alignment.")

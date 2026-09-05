@@ -36,6 +36,7 @@
 #include "colmap/scene/projection.h"
 #include "colmap/util/logging.h"
 
+#include <map>
 #include <unordered_map>
 
 namespace colmap {
@@ -248,23 +249,36 @@ bool AlignReconstructionToPosePriors(
   src.reserve(tgt_pose_priors.size());
   tgt.reserve(tgt_pose_priors.size());
 
-  std::unordered_map<image_t, PosePrior> tgt_image_to_pose_prior;
+  std::map<data_t, const PosePrior*> tgt_data_to_pose_prior;
   for (const auto& pose_prior : tgt_pose_priors) {
-    if (pose_prior.corr_data_id.sensor_id.type == SensorType::CAMERA &&
-        pose_prior.HasPosition()) {
-      THROW_CHECK(tgt_image_to_pose_prior
-                      .emplace(pose_prior.corr_data_id.id, pose_prior)
-                      .second)
-          << "Duplicate pose prior for image " << pose_prior.corr_data_id.id;
-    }
+    if (!pose_prior.HasPosition()) continue;
+    THROW_CHECK(
+        tgt_data_to_pose_prior.emplace(pose_prior.corr_data_id, &pose_prior)
+            .second)
+        << "Duplicate pose prior for data " << pose_prior.corr_data_id.id;
   }
 
-  for (const image_t image_id : src_reconstruction.RegImageIds()) {
-    const auto pose_prior_it = tgt_image_to_pose_prior.find(image_id);
-    if (pose_prior_it != tgt_image_to_pose_prior.end()) {
-      const auto& image = src_reconstruction.Image(image_id);
-      src.push_back(image.ProjectionCenter());
-      tgt.push_back(pose_prior_it->second.position);
+  // Camera priors are matched by image. Priors on any other rigidly mounted
+  // sensor -- a GNSS antenna, say -- are matched through the frame that
+  // recorded them, their world position derived from the frame's rig pose and
+  // the sensor's known sensor_from_rig. That is what lets an antenna position
+  // be used directly, instead of first having to be converted into a
+  // camera-centre prior (which needs the yaw the solve has not produced yet).
+  // See plan-6 item 3.
+  for (const frame_t frame_id : src_reconstruction.RegFrameIds()) {
+    const class Frame& frame = src_reconstruction.Frame(frame_id);
+    if (!frame.HasPose() || !frame.HasRigPtr()) continue;
+    const class Rig& rig = *frame.RigPtr();
+    for (const data_t& data_id : frame.DataIds()) {
+      const auto pose_prior_it = tgt_data_to_pose_prior.find(data_id);
+      if (pose_prior_it == tgt_data_to_pose_prior.end()) continue;
+      if (!rig.HasSensor(data_id.sensor_id)) continue;
+      if (!rig.IsRefSensor(data_id.sensor_id) &&
+          !rig.HasSensorFromRig(data_id.sensor_id)) {
+        continue;
+      }
+      src.push_back(frame.SensorFromWorld(data_id.sensor_id).TgtOriginInSrc());
+      tgt.push_back(pose_prior_it->second->position);
     }
   }
 

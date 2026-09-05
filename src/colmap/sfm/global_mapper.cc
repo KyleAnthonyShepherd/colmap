@@ -59,6 +59,22 @@ GlobalMapperOptions InitializeOptions(const GlobalMapperOptions& options) {
   return opts;
 }
 
+// Copies the position-prior settings onto an IncrementalMapper::Options, so
+// PnP registration and local bundle adjustment are governed by exactly the
+// same constraint. A no-op when priors are off or none could be placed.
+void ApplyPositionPriorOptions(const WorldPositionPriors& position_priors,
+                               IncrementalMapper::Options* mapper_options) {
+  if (position_priors.Empty()) return;
+  const PriorPositionSettings& settings = position_priors.settings;
+  mapper_options->use_prior_position = true;
+  mapper_options->use_robust_loss_on_prior_position = settings.use_robust_loss;
+  mapper_options->prior_position_loss_scale = settings.loss_scale;
+  mapper_options->prior_position_fallback_stddev = settings.fallback_stddev;
+  mapper_options->prior_position_max_error_sigma = settings.max_error_sigma;
+  mapper_options->prior_position_max_error_m = settings.max_error_m;
+  mapper_options->pose_priors_in_world = position_priors.priors;
+}
+
 }  // namespace
 
 GlobalMapper::GlobalMapper(std::shared_ptr<const DatabaseCache> database_cache)
@@ -305,9 +321,11 @@ bool GlobalMapper::GlobalPositioning(const GlobalPositionerOptions& options,
       ReprojectionErrorType::NORMALIZED);
 
   // Normalize the structure for numerical stability.
-  // TODO: Skip normalization when position priors are used (similar to
-  // incremental mapper's !use_prior_position condition).
-  reconstruction_->Normalize();
+  // Skipped under position priors: the priors have made the model metric,
+  // and Normalize() would rescale exactly that away.
+  if (!UsePositionPriors()) {
+    reconstruction_->Normalize();
+  }
 
   return true;
 }
@@ -341,9 +359,11 @@ bool GlobalMapper::IterativeBundleAdjustment(
               << num_iterations << " finished";
 
     // Normalize the structure for numerical stability.
-    // TODO: Skip normalization when position priors are used (similar to
-    // incremental mapper's !use_prior_position condition).
-    reconstruction_->Normalize();
+    // Skipped under position priors: the priors have made the model metric,
+    // and Normalize() would rescale exactly that away.
+    if (!UsePositionPriors()) {
+      reconstruction_->Normalize();
+    }
 
     // Filter tracks based on the estimation
     // For the filtering, in each round, the criteria for outlier is
@@ -416,14 +436,30 @@ bool GlobalMapper::IterativeRetriangulateAndRefine(
   }
 
   // Iterative global refinement.
+  //
+  // On the full path the priors go through AdjustGlobalBundle's existing
+  // pose-prior adjuster (the same one `pose_prior_mapper` uses), which aligns
+  // the model to the priors and therefore leaves it metric. Normalization is
+  // skipped in that case for the same reason the incremental mapper skips it:
+  // it would rescale the metric solution away.
   IncrementalMapper::Options mapper_options;
   mapper_options.random_seed = options.random_seed;
+  ApplyPositionPriorOptions(position_priors_, &mapper_options);
+  const bool use_prior_position = mapper_options.use_prior_position;
+  if (use_prior_position) {
+    for (const image_t image_id : reconstruction_->RegImageIds()) {
+      if (position_priors_.Find(image_id) != nullptr) {
+        prior_constrained_image_ids_.insert(image_id);
+      }
+    }
+  }
   mapper.IterativeGlobalRefinement(/*max_num_refinements=*/5,
                                    /*max_refinement_change=*/0.0005,
                                    mapper_options,
                                    custom_ba_options,
                                    options,
-                                   /*normalize_reconstruction=*/true);
+                                   /*normalize_reconstruction=*/
+                                   !use_prior_position);
 
   mapper.EndReconstruction(/*discard=*/false);
 
@@ -439,9 +475,11 @@ bool GlobalMapper::IterativeRetriangulateAndRefine(
   }
 
   // Normalize the structure for numerical stability.
-  // TODO: Skip normalization when position priors are used (similar to
-  // incremental mapper's !use_prior_position condition).
-  reconstruction_->Normalize();
+  // Skipped under position priors: the priors have made the model metric,
+  // and Normalize() would rescale exactly that away.
+  if (!UsePositionPriors()) {
+    reconstruction_->Normalize();
+  }
 
   obs_manager.FilterPoints3DWithLargeReprojectionError(
       max_normalized_reproj_error,
@@ -1069,6 +1107,37 @@ std::optional<Eigen::Vector3d> GlobalMapper::CollectGravityPriors(
 
 // ── GlobalMapper::RegisterNewImagesByPnP ────────────────────────
 
+bool GlobalMapper::ComputeWorldPositionPriors(
+    const GlobalMapperOptions& options) {
+  THROW_CHECK_NOTNULL(reconstruction_);
+  position_priors_ = WorldPositionPriors();
+
+  if (!options.use_prior_position) return false;
+
+  if (database_cache_->PosePriors().empty()) {
+    LOG(WARNING) << "Position priors requested but the database has none; "
+                    "solving without them.";
+    return false;
+  }
+
+  WorldPositionPriorOptions prior_options;
+  prior_options.fallback_stddev = options.prior_position_fallback_stddev;
+  prior_options.alignment_ransac_options.random_seed = options.random_seed;
+  position_priors_ = CollectWorldPositionPriors(
+      *database_cache_, *reconstruction_, prior_options);
+
+  position_priors_.settings.use_robust_loss =
+      options.use_robust_loss_on_prior_position;
+  position_priors_.settings.loss_scale = options.prior_position_loss_scale;
+  position_priors_.settings.fallback_stddev =
+      options.prior_position_fallback_stddev;
+  position_priors_.settings.max_error_sigma =
+      options.prior_position_max_error_sigma;
+  position_priors_.settings.max_error_m = options.prior_position_max_error_m;
+
+  return !position_priors_.Empty();
+}
+
 std::unordered_set<image_t> GlobalMapper::RegisterNewImagesByPnP(
     const GlobalMapperOptions& options, IncrementalAddLedger* ledger) {
   THROW_CHECK_NOTNULL(reconstruction_);
@@ -1119,6 +1188,19 @@ std::unordered_set<image_t> GlobalMapper::RegisterNewImagesByPnP(
   // instead of 6 means the few correspondences a weakly-connected image has
   // constrain the pose far more tightly. RefineAbsolutePose still polishes
   // without the constraint, so IMU error does not enter the output pose.
+  // Position priors gate the registration: a pose that disagrees with its
+  // GNSS fix is declined here rather than admitted and left to displace every
+  // frame registered after it. See plan-6 item 1.
+  ApplyPositionPriorOptions(position_priors_, &mapper_options);
+  if (mapper_options.use_prior_position) {
+    LOG(INFO) << "RegisterNewImagesByPnP: position-prior acceptance gate "
+                 "active over "
+              << mapper_options.pose_priors_in_world.size()
+              << " prior(s) at " << mapper_options.prior_position_max_error_sigma
+              << " sigma / " << mapper_options.prior_position_max_error_m
+              << " m.";
+  }
+
   std::unordered_map<image_t, Eigen::Vector3d> image_to_gravity;
   mapper_options.gravity_in_world = CollectGravityPriors(&image_to_gravity);
   mapper_options.gravity_uncertainty_deg = options.gravity_uncertainty_deg;
@@ -1253,6 +1335,19 @@ bool GlobalMapper::SolveIncrementalWindowed(
     }
   }
 
+  // The windowed add's whole point is that it is the live path; without this
+  // it is also the one path that cannot use GNSS. The priors are already in
+  // this reconstruction's frame, so local bundle adjustment can add them as
+  // position residuals on the images the window leaves free -- no alignment,
+  // no normalization, and therefore no movement of the prior model's gauge.
+  // See plan-6 item 1.
+  ApplyPositionPriorOptions(position_priors_, &mapper_options);
+  if (mapper_options.use_prior_position) {
+    LOG(INFO) << "SolveIncrementalWindowed: constraining the window with "
+              << mapper_options.pose_priors_in_world.size()
+              << " position prior(s).";
+  }
+
   BundleAdjustmentOptions ba_options = opts.bundle_adjustment;
   ba_options.print_summary = false;
   if (ba_options.ceres) {
@@ -1282,6 +1377,13 @@ bool GlobalMapper::SolveIncrementalWindowed(
   // what stops a drip-fed session from bleeding structure.
   acc.completed += mapper.CompleteTracks(tri_options);
   acc.merged += mapper.MergeTracks(tri_options);
+
+  // Record which poses the priors actually pulled on, for the residual
+  // report's `used_in_ba` column (plan-6 item 2).
+  const std::unordered_set<image_t>& prior_constrained =
+      mapper.PriorConstrainedImageIds();
+  prior_constrained_image_ids_.insert(prior_constrained.begin(),
+                                      prior_constrained.end());
 
   mapper.EndReconstruction(/*discard=*/false);
 

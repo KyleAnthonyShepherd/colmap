@@ -11,14 +11,17 @@
 #include "colmap/scene/database_cache.h"
 #include "colmap/scene/reconstruction.h"
 #include "colmap/sfm/global_mapper.h"
+#include "colmap/sfm/prior_positions.h"
 #include "colmap/util/logging.h"
 #include "colmap/util/misc.h"
 #include "colmap/util/timer.h"
 
+#include <algorithm>
 #include <fstream>
 #include <iomanip>
 #include <limits>
 #include <sstream>
+#include <string>
 
 namespace colmap {
 
@@ -44,6 +47,71 @@ void WarnInsufficientPriorFocalLengths() {
       << "% of cameras have prior focal lengths. The global mapper depends on "
          "reasonably good focal length priors. Consider running "
          "'colmap view_graph_calibrator' first.";
+}
+
+// ── Incremental ledger schema ──────────────────────────────────────────────
+
+constexpr const char* kLedgerHeader =
+    "add\tpath\tprior_points\timported\tdrop_missing_image\t"
+    "drop_bad_idx\tdrop_already_linked\tdrop_short_track\t"
+    "triangulated\tmerged\tcompleted\trecovered\tpoints_out\t"
+    "mean_reproj\tmean_track_len\tintrinsics_refreshed\t"
+    "prior_residuals\tprior_rms\tprior_worst\tprior_worst_sigma\t"
+    "prior_worst_image";
+
+size_t CountColumns(const std::string& line) {
+  return static_cast<size_t>(std::count(line.begin(), line.end(), '\t')) + 1;
+}
+
+void StripCarriageReturn(std::string* line) {
+  if (!line->empty() && line->back() == '\r') line->pop_back();
+}
+
+// Copies a ledger written by a previous add into `path`, widening it to the
+// current schema. Rows from an older build are padded with empty fields --
+// empty rather than zero, because the column did not exist then and a zero
+// would read as a measurement.
+void CarryForwardLedger(const std::filesystem::path& prior_path,
+                        const std::filesystem::path& path) {
+  std::ifstream in(prior_path);
+  if (!in.is_open()) {
+    LOG(WARNING) << "AppendIncrementalLedger: could not read " << prior_path;
+    return;
+  }
+  std::string header;
+  if (!std::getline(in, header)) {
+    // Empty prior ledger: nothing to carry, the fresh header is written by
+    // the caller.
+    return;
+  }
+  StripCarriageReturn(&header);
+
+  std::ofstream out(path);
+  if (!out.is_open()) {
+    LOG(WARNING) << "AppendIncrementalLedger: could not write " << path;
+    return;
+  }
+
+  const size_t num_columns = CountColumns(kLedgerHeader);
+  if (CountColumns(header) > num_columns) {
+    // A ledger from a *newer* build. Copying it unchanged keeps its data
+    // readable; the rows this build appends will simply be narrower.
+    LOG(WARNING) << "AppendIncrementalLedger: " << prior_path
+                 << " has more columns than this build writes; carrying it "
+                    "forward unchanged.";
+    out << header << "\n" << in.rdbuf();
+    return;
+  }
+
+  out << kLedgerHeader << "\n";
+  std::string line;
+  while (std::getline(in, line)) {
+    StripCarriageReturn(&line);
+    if (line.empty()) continue;
+    out << line;
+    for (size_t i = CountColumns(line); i < num_columns; ++i) out << "\t";
+    out << "\n";
+  }
 }
 
 }  // namespace
@@ -205,24 +273,19 @@ void AppendIncrementalLedger(const std::filesystem::path& path,
                              const char* path_label,
                              const IncrementalAddLedger& ledger) {
   // Carry the prior session's history forward, since each add writes into a
-  // fresh output directory that the server then swaps into place.
-  std::error_code ec;
+  // fresh output directory that the server then swaps into place. A ledger
+  // written by an older build has fewer columns, so it is migrated rather
+  // than copied: appending wider rows to a narrower file would produce a
+  // ragged TSV that the site pipeline cannot parse.
   if (!std::filesystem::exists(path) && std::filesystem::exists(prior_path)) {
-    std::filesystem::copy_file(prior_path, path, ec);
-    if (ec) {
-      LOG(WARNING) << "AppendIncrementalLedger: could not carry forward "
-                   << prior_path << ": " << ec.message();
-    }
+    CarryForwardLedger(prior_path, path);
   }
 
   const bool need_header = !std::filesystem::exists(path);
   std::ofstream file(path, std::ios::app);
   THROW_CHECK(file.is_open()) << "Cannot write ledger to " << path;
   if (need_header) {
-    file << "add\tpath\tprior_points\timported\tdrop_missing_image\t"
-            "drop_bad_idx\tdrop_already_linked\tdrop_short_track\t"
-            "triangulated\tmerged\tcompleted\trecovered\tpoints_out\t"
-            "mean_reproj\tmean_track_len\tintrinsics_refreshed\n";
+    file << kLedgerHeader << "\n";
   }
   file << add_index << "\t" << path_label << "\t"
        << ledger.prior_points_total << "\t" << ledger.imported << "\t"
@@ -232,7 +295,14 @@ void AppendIncrementalLedger(const std::filesystem::path& path,
        << ledger.merged << "\t" << ledger.completed << "\t"
        << ledger.recovered << "\t" << ledger.points_out << "\t"
        << ledger.mean_reproj_error << "\t" << ledger.mean_track_length << "\t"
-       << (ledger.intrinsics_refreshed ? 1 : 0) << "\n";
+       << (ledger.intrinsics_refreshed ? 1 : 0) << "\t"
+       << ledger.prior_residuals << "\t" << ledger.prior_residual_rms << "\t"
+       << ledger.prior_residual_worst << "\t"
+       << ledger.prior_residual_worst_sigma << "\t"
+       << (ledger.prior_residual_worst_image == kInvalidImageId
+               ? std::string("")
+               : std::to_string(ledger.prior_residual_worst_image))
+       << "\n";
 }
 
 bool RealignToAnchors(const AnchorSet& anchor_set,
@@ -281,6 +351,11 @@ IncrementalGlobalPipeline::IncrementalGlobalPipeline(
   cache_opts.ignore_watermarks = options_.ignore_watermarks;
   cache_opts.image_names = {options_.image_names.begin(),
                              options_.image_names.end()};
+  // WGS84 priors are useless to a metric solver as latitude/longitude, so
+  // convert them to Cartesian ENU on load, exactly as the incremental
+  // pipeline does. Priors already written as CARTESIAN (which is what the
+  // site pipeline does, deliberately) pass through untouched.
+  cache_opts.convert_pose_priors_to_enu = options_.mapper.use_prior_position;
 
   database_cache_ = DatabaseCache::Create(*database, cache_opts);
 
@@ -328,6 +403,25 @@ void IncrementalGlobalPipeline::Run() {
     for (const image_t image_id : SelectAnchorImages(*reconstruction)) {
       anchors_.anchors.emplace_back(
           image_id, reconstruction->Image(image_id).ProjectionCenter());
+    }
+
+    // Report prior residuals even on this path. This solve does not use the
+    // priors as a constraint (that is `pose_prior_mapper`'s job), so every
+    // residual is reported with used_in_ba = 0 -- which is exactly the
+    // measurement that says how far a priorless model has drifted from the
+    // GNSS track.
+    if (mapper_opts.use_prior_position) {
+      WorldPositionPriorOptions prior_opts;
+      prior_opts.fallback_stddev = mapper_opts.prior_position_fallback_stddev;
+      prior_opts.alignment_ransac_options.random_seed = mapper_opts.random_seed;
+      prior_residuals_ = ComputePriorPositionResiduals(
+          *reconstruction,
+          CollectWorldPositionPriors(
+              *database_cache_, *reconstruction, prior_opts),
+          /*used_in_ba=*/{},
+          mapper_opts.prior_position_fallback_stddev,
+          mapper_opts.use_robust_loss_on_prior_position,
+          mapper_opts.prior_position_loss_scale);
     }
     return;
   }
@@ -409,6 +503,24 @@ void IncrementalGlobalPipeline::Run() {
   mapper.LoadPriorPoses(prior_reconstruction);
 
   LOG(INFO) << "Prior images loaded: " << mapper.PriorImageIds().size();
+
+  // 5b. Place the database's position priors in this reconstruction's frame.
+  //
+  //     This has to happen after LoadPriorPoses (the fit needs solved camera
+  //     centres to work from) and before registration (which the priors
+  //     gate). If it fails -- too few priors, or a fit that will not
+  //     converge -- the add simply runs unconstrained, exactly as before.
+  if (mapper_opts.use_prior_position) {
+    if (mapper.ComputeWorldPositionPriors(mapper_opts)) {
+      LOG(INFO) << "Position priors active for this add: "
+                << mapper.PositionPriors().priors.size() << " prior(s), "
+                << "alignment rmse "
+                << mapper.PositionPriors().alignment_rmse << " m.";
+    } else {
+      LOG(WARNING) << "Position priors requested but unusable for this add; "
+                      "solving without them.";
+    }
+  }
 
   // 6. Give the new image(s) a pose.
   //
@@ -552,7 +664,19 @@ void IncrementalGlobalPipeline::Run() {
   //     compounding). Fallback: legacy rolling Sim3 over all prior centres.
   //     Windowed solves never leave the prior frame, so realignment is
   //     unnecessary there.
-  if (!windowed && mapper_opts.realign_to_prior_after_solve) {
+  //
+  //     Also skipped when position priors are in use. The priors are then the
+  //     gauge: a full solve has aligned the model to them and it is metric,
+  //     and a Sim3 onto anchor centres recorded from an earlier solve would
+  //     pull that back -- undoing the correction rather than checking it.
+  const bool prior_positions_active = mapper.UsePositionPriors();
+  if (prior_positions_active && !windowed &&
+      mapper_opts.realign_to_prior_after_solve) {
+    LOG(INFO) << "Skipping realignment to the prior frame: position priors "
+                 "already fix the gauge and keep the model metric.";
+  }
+  if (!windowed && !prior_positions_active &&
+      mapper_opts.realign_to_prior_after_solve) {
     const bool anchor_aligned =
         have_prior_anchors &&
         RealignToAnchors(prior_anchors, reconstruction.get());
@@ -594,6 +718,45 @@ void IncrementalGlobalPipeline::Run() {
                "registered in the output reconstruction.";
       }
     }
+  }
+
+  // 10b. Per-image position-prior residuals (plan-6 item 2).
+  //
+  //      Computed after the solve and after any realignment, so the numbers
+  //      describe the model as it is written out. Everything here is already
+  //      known to bundle adjustment; the point is that it stops being
+  //      implicit. A displaced frame is identifiable from this one file --
+  //      residual, sigma, robust weight -- rather than from a Sim3 and six
+  //      rounds of re-deriving per-frame rotations.
+  if (prior_positions_active) {
+    // Recompute the frame fit against the final poses: the solve has moved
+    // them, so the priors captured before registration are one solve stale.
+    WorldPositionPriorOptions prior_opts;
+    prior_opts.fallback_stddev = mapper_opts.prior_position_fallback_stddev;
+    prior_opts.alignment_ransac_options.random_seed = mapper_opts.random_seed;
+    const WorldPositionPriors final_priors = CollectWorldPositionPriors(
+        *database_cache_, *reconstruction, prior_opts);
+
+    prior_residuals_ = ComputePriorPositionResiduals(
+        *reconstruction,
+        final_priors.Empty() ? mapper.PositionPriors() : final_priors,
+        mapper.PriorConstrainedImageIds(),
+        mapper_opts.prior_position_fallback_stddev,
+        mapper_opts.use_robust_loss_on_prior_position,
+        mapper_opts.prior_position_loss_scale);
+
+    const PriorPositionResidualSummary summary =
+        SummarizePriorPositionResiduals(prior_residuals_);
+    ledger_.prior_residuals = summary.num_residuals;
+    ledger_.prior_residual_rms = summary.rms;
+    ledger_.prior_residual_worst = summary.worst_norm;
+    ledger_.prior_residual_worst_sigma = summary.worst_mahalanobis;
+    ledger_.prior_residual_worst_image = summary.worst_image_id;
+
+    LOG(INFO) << "Position-prior residuals: " << summary.num_residuals
+              << " image(s), rms " << summary.rms << " m, worst "
+              << summary.worst_norm << " m (" << summary.worst_mahalanobis
+              << " sigma) at image " << summary.worst_image_id << ".";
   }
 
   // 11. Propagate or create the gauge anchors to persist with the output:

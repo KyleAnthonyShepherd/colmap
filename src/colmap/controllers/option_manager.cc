@@ -569,6 +569,26 @@ void OptionManager::AddMapperOptions() {
   AddDefaultOption("Mapper.extract_colors", &mapper->extract_colors);
   AddDefaultOption("Mapper.num_threads", &mapper->num_threads);
   AddDefaultOption("Mapper.random_seed", &mapper->random_seed);
+  // Position priors. Registered here so that `mapper --help | grep -i prior`
+  // answers the question instead of returning nothing, which reads like a
+  // version problem. `pose_prior_mapper` is `mapper` with
+  // use_prior_position forced on, and exposes the same three settings
+  // *un-prefixed* (--use_prior_position, not --Mapper.use_prior_position);
+  // both spellings work here. `incremental_global_mapper` takes the
+  // un-prefixed spelling for the live-add path.
+  AddDefaultOption("Mapper.use_prior_position",
+                   &mapper->use_prior_position,
+                   "Constrain the reconstruction with the database's position "
+                   "priors. `pose_prior_mapper` turns this on for you and "
+                   "adds the covariance-overwrite options; "
+                   "`incremental_global_mapper` does the same for live adds.");
+  AddDefaultOption("Mapper.use_robust_loss_on_prior_position",
+                   &mapper->use_robust_loss_on_prior_position,
+                   "Down-weight prior-position residuals with a Cauchy loss.");
+  AddDefaultOption("Mapper.prior_position_loss_scale",
+                   &mapper->prior_position_loss_scale,
+                   "Threshold on the covariance-whitened prior-position "
+                   "residual for the robust loss (chi2, 3 DOF, 95% = 7.815).");
   AddDefaultOption("Mapper.min_focal_length_ratio",
                    &mapper->min_focal_length_ratio);
   AddDefaultOption("Mapper.max_focal_length_ratio",

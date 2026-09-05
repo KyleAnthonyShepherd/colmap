@@ -68,6 +68,11 @@ void Frame::SetRigPtr(class Rig* rig) {
       case SensorType::IMU:
         // Note that we do not (yet) support IMU measurement data.
         break;
+      case SensorType::GNSS:
+        // A GNSS sensor carries no measurement data in a reconstruction; it
+        // exists so that position priors and a refinable lever arm can be
+        // attached to it. See plan-6 item 3.
+        break;
       case SensorType::INVALID:
         LOG(FATAL_THROW) << "Invalid sensor type: " << data_id.sensor_id.type;
         break;

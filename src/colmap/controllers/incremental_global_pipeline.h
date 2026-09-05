@@ -201,6 +201,15 @@ class IncrementalGlobalPipeline : public BaseController {
   // written through unchanged.
   const char* PathLabel() const { return path_label_; }
 
+  // Per-image position-prior residuals for this add, to be written beside the
+  // reconstruction. Empty when position priors are not in use. See plan-6
+  // item 2: everything bundle adjustment already knows about the gap between
+  // a camera and its prior, made available during the walk rather than only
+  // at finalize.
+  const std::vector<PriorPositionResidual>& PriorResiduals() const {
+    return prior_residuals_;
+  }
+
  private:
   const IncrementalGlobalPipelineOptions options_;
   std::shared_ptr<DatabaseCache> database_cache_;
@@ -208,6 +217,7 @@ class IncrementalGlobalPipeline : public BaseController {
   AnchorSet anchors_;
   IncrementalState state_;
   IncrementalAddLedger ledger_;
+  std::vector<PriorPositionResidual> prior_residuals_;
   const char* path_label_ = "full";
 };
 

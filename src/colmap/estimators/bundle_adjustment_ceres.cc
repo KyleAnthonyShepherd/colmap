@@ -38,7 +38,10 @@
 #include "colmap/util/misc.h"
 #include "colmap/util/threading.h"
 
+#include <algorithm>
 #include <iomanip>
+#include <map>
+#include <unordered_set>
 
 namespace colmap {
 
@@ -890,27 +893,63 @@ class PosePriorBundleAdjuster : public CeresBundleAdjuster {
         reconstruction_(reconstruction) {
     THROW_CHECK(prior_options_.Check());
 
+    // Index the non-camera sensor data of every frame, so a prior attached to
+    // e.g. a GNSS antenna can be resolved to the frame it was captured in.
+    // The antenna is exactly a second sensor rigidly mounted to the camera:
+    // giving it its own prior lets bundle adjustment solve the pose and the
+    // lever arm together instead of requiring a camera-centre prior that can
+    // only be derived once the model is already solved. See plan-6 item 3.
+    // Built only when a non-camera prior is actually present: this walks
+    // every frame, and a windowed incremental add constructs one of these per
+    // local bundle adjustment, where an unconditional O(N) sweep would undo
+    // the point of the window.
+    const bool has_non_camera_priors =
+        std::any_of(pose_priors_.begin(),
+                    pose_priors_.end(),
+                    [](const PosePrior& pose_prior) {
+                      return pose_prior.corr_data_id.sensor_id.type !=
+                             SensorType::CAMERA;
+                    });
+    if (has_non_camera_priors) {
+      for (const auto& [frame_id, frame] : reconstruction_.Frames()) {
+        for (const data_t& data_id : frame.DataIds()) {
+          if (data_id.sensor_id.type == SensorType::CAMERA) continue;
+          sensor_data_to_frame_.emplace(data_id, frame_id);
+        }
+      }
+    }
+
     // Filter irrelevant pose priors.
     pose_priors_.erase(
         std::remove_if(pose_priors_.begin(),
                        pose_priors_.end(),
                        [this](const auto& pose_prior) {
                          return !pose_prior.HasPosition() ||
-                                pose_prior.corr_data_id.sensor_id.type !=
-                                    SensorType::CAMERA ||
-                                !config_.HasImage(pose_prior.corr_data_id.id);
+                                ResolvePriorFrameId(pose_prior) ==
+                                    kInvalidFrameId;
                        }),
         pose_priors_.end());
 
-    const bool use_prior_position = AlignReconstruction();
+    // With alignment disabled the caller asserts that the reconstruction is
+    // already in the priors' frame and owns the gauge itself (see
+    // PosePriorBundleAdjustmentOptions::align_reconstruction_to_priors), so
+    // neither the Sim3 alignment, the normalization, nor the gauge fixing
+    // below may run -- each of them would move poses the caller is holding
+    // fixed on purpose.
+    const bool use_prior_position =
+        prior_options_.align_reconstruction_to_priors ? AlignReconstruction()
+                                                      : !pose_priors_.empty();
 
     // Fix 7-DOFs of BA problem if not enough valid pose priors.
     if (use_prior_position) {
-      // Normalize the reconstruction to avoid any numerical instability but
-      // do not transform priors as they will be transformed when added to
-      // ceres::Problem.
-      normalized_from_metric_ = reconstruction_.Normalize(/*fixed_scale=*/true);
-    } else {
+      if (prior_options_.align_reconstruction_to_priors) {
+        // Normalize the reconstruction to avoid any numerical instability but
+        // do not transform priors as they will be transformed when added to
+        // ceres::Problem.
+        normalized_from_metric_ =
+            reconstruction_.Normalize(/*fixed_scale=*/true);
+      }
+    } else if (prior_options_.align_reconstruction_to_priors) {
       config_.FixGauge(BundleAdjustmentGauge::THREE_POINTS);
     }
 
@@ -925,14 +964,28 @@ class PosePriorBundleAdjuster : public CeresBundleAdjuster {
 
       // Only consider parameterized images for pose priors. Notice that some
       // images may be configured to be included in the BA problem but have no
-      // reprojection constraints, etc.
+      // reprojection constraints, etc. A prior on a non-camera rig sensor is
+      // parameterized through its frame, so it qualifies as soon as any image
+      // of that frame does.
       const std::set<image_t>& parameterized_image_ids =
           default_bundle_adjuster_->ParameterizedImageIds();
+      std::unordered_set<frame_t> parameterized_frame_ids;
+      parameterized_frame_ids.reserve(parameterized_image_ids.size());
+      for (const image_t image_id : parameterized_image_ids) {
+        parameterized_frame_ids.insert(
+            reconstruction_.Image(image_id).FrameId());
+      }
       for (const auto& pose_prior : pose_priors_) {
-        if (parameterized_image_ids.count(pose_prior.corr_data_id.id) > 0) {
-          AddImagePosePriorToProblem(
-              pose_prior.corr_data_id.id, pose_prior, reconstruction);
+        const frame_t frame_id = ResolvePriorFrameId(pose_prior);
+        if (frame_id == kInvalidFrameId) continue;
+        if (pose_prior.corr_data_id.sensor_id.type == SensorType::CAMERA) {
+          if (parameterized_image_ids.count(pose_prior.corr_data_id.id) == 0) {
+            continue;
+          }
+        } else if (parameterized_frame_ids.count(frame_id) == 0) {
+          continue;
         }
+        AddPosePriorToProblem(frame_id, pose_prior);
       }
     }
   }
@@ -947,7 +1000,13 @@ class PosePriorBundleAdjuster : public CeresBundleAdjuster {
     ceres::Solver::Summary ceres_summary =
         SolveWithGpuFallback(options_, config_, problem.get());
 
-    reconstruction_.Transform(Inverse(normalized_from_metric_));
+    // Undo the normalization applied in the constructor. With alignment
+    // disabled none was applied, and Transform() touches every image and
+    // every 3D point -- an O(N) pass that a windowed add must not pay on
+    // each of its local solves.
+    if (prior_options_.align_reconstruction_to_priors) {
+      reconstruction_.Transform(Inverse(normalized_from_metric_));
+    }
 
     if (options_.print_summary || VLOG_IS_ON(1)) {
       PrintSolverSummary(ceres_summary, "Pose Prior Bundle adjustment report");
@@ -961,23 +1020,61 @@ class PosePriorBundleAdjuster : public CeresBundleAdjuster {
     return default_bundle_adjuster_->Problem();
   }
 
-  void AddImagePosePriorToProblem(image_t image_id,
-                                  const PosePrior& pose_prior,
-                                  Reconstruction& reconstruction) {
-    Image& image = reconstruction.Image(image_id);
+  // Frame a pose prior's residual can be attached to, or kInvalidFrameId
+  // when it cannot be attached at all.
+  //
+  // A camera prior needs its image in the BA config. A prior on any other
+  // sensor -- a GNSS antenna, say -- is resolved through the frame that
+  // recorded it; that frame's rig must actually carry the sensor with a known
+  // sensor_from_rig, since the residual is evaluated through it.
+  frame_t ResolvePriorFrameId(const PosePrior& pose_prior) const {
+    const data_t& data_id = pose_prior.corr_data_id;
+    if (data_id.sensor_id.type == SensorType::CAMERA) {
+      if (!config_.HasImage(data_id.id)) return kInvalidFrameId;
+      if (!reconstruction_.ExistsImage(data_id.id)) return kInvalidFrameId;
+      const frame_t frame_id = reconstruction_.Image(data_id.id).FrameId();
+      // An unposed frame has no rig_from_world to evaluate the residual
+      // against, and asking for one throws.
+      if (!reconstruction_.Frame(frame_id).HasPose()) return kInvalidFrameId;
+      return frame_id;
+    }
+
+    const auto it = sensor_data_to_frame_.find(data_id);
+    if (it == sensor_data_to_frame_.end()) return kInvalidFrameId;
+    const frame_t frame_id = it->second;
+    const class Frame& frame = reconstruction_.Frame(frame_id);
+    if (!frame.HasPose() || !frame.HasRigPtr()) return kInvalidFrameId;
+    const class Rig& rig = *frame.RigPtr();
+    if (!rig.HasSensor(data_id.sensor_id)) return kInvalidFrameId;
+    if (!rig.IsRefSensor(data_id.sensor_id) &&
+        !rig.HasSensorFromRig(data_id.sensor_id)) {
+      // The lever arm is unknown, so the antenna position says nothing about
+      // where the rig is. BA can refine a lever arm but not invent one.
+      LOG(WARNING) << "Pose prior on sensor " << data_id.sensor_id.id
+                   << " of type " << data_id.sensor_id.type
+                   << " has no sensor_from_rig transform in rig "
+                   << rig.RigId() << "; ignoring the prior.";
+      return kInvalidFrameId;
+    }
+    return frame_id;
+  }
+
+  void AddPosePriorToProblem(frame_t frame_id, const PosePrior& pose_prior) {
+    Frame& frame = reconstruction_.Frame(frame_id);
+    const sensor_t sensor_id = pose_prior.corr_data_id.sensor_id;
+    const bool is_ref_sensor = frame.RigPtr()->IsRefSensor(sensor_id);
 
     const bool constant_sensor_from_rig =
-        !options_.refine_sensor_from_rig ||
-        config_.HasConstantSensorFromRigPose(image.CameraPtr()->SensorId());
+        is_ref_sensor || !options_.refine_sensor_from_rig ||
+        config_.HasConstantSensorFromRigPose(sensor_id);
     const bool constant_rig_from_world =
         !options_.refine_rig_from_world ||
-        config_.HasConstantRigFromWorldPose(image.FrameId());
+        config_.HasConstantRigFromWorldPose(frame_id);
     if (constant_sensor_from_rig && constant_rig_from_world) {
       return;
     }
 
     ceres::Problem& problem = *default_bundle_adjuster_->Problem();
-    Frame& frame = *image.FramePtr();
 
     Rigid3d& rig_from_world = frame.RigFromWorld();
 
@@ -996,21 +1093,24 @@ class PosePriorBundleAdjuster : public CeresBundleAdjuster {
         normalized_from_metric_scaled_rotation * position_cov *
         normalized_from_metric_scaled_rotation.transpose();
 
-    if (image.IsRefInFrame()) {
+    if (is_ref_sensor) {
       problem.AddResidualBlock(
           CovarianceWeightedCostFunctor<AbsolutePosePositionPriorCostFunctor>::
               Create(normalized_position_cov, normalized_position),
           prior_loss_function_.get(),
           rig_from_world.params.data());
     } else {
-      Rigid3d& cam_from_rig =
-          frame.RigPtr()->SensorFromRig(image.CameraPtr()->SensorId());
+      // Both the rig pose and the sensor's own offset enter the residual, so
+      // a sensor_from_rig left variable by --ba_refine_sensor_from_rig is
+      // *estimated* here: the lever arm becomes an output of the solve rather
+      // than something the caller has to measure. See plan-6 item 3.
+      Rigid3d& sensor_from_rig = frame.RigPtr()->SensorFromRig(sensor_id);
       problem.AddResidualBlock(
           CovarianceWeightedCostFunctor<
               AbsoluteRigPosePositionPriorCostFunctor>::
               Create(normalized_position_cov, normalized_position),
           prior_loss_function_.get(),
-          cam_from_rig.params.data(),
+          sensor_from_rig.params.data(),
           rig_from_world.params.data());
     }
   }
@@ -1057,9 +1157,17 @@ class PosePriorBundleAdjuster : public CeresBundleAdjuster {
       std::vector<double> verr2_wrt_prior;
       verr2_wrt_prior.reserve(config_.NumImages());
       for (const auto& pose_prior : pose_priors_) {
-        const auto& image = reconstruction_.Image(pose_prior.corr_data_id.id);
+        const frame_t frame_id = ResolvePriorFrameId(pose_prior);
+        if (frame_id == kInvalidFrameId) continue;
+        const class Frame& frame = reconstruction_.Frame(frame_id);
+        const Eigen::Vector3d sensor_position =
+            frame.SensorFromWorld(pose_prior.corr_data_id.sensor_id)
+                .TgtOriginInSrc();
         verr2_wrt_prior.push_back(
-            (image.ProjectionCenter() - pose_prior.position).squaredNorm());
+            (sensor_position - pose_prior.position).squaredNorm());
+      }
+      if (verr2_wrt_prior.empty()) {
+        return true;
       }
       VLOG(2) << "Alignment error w.r.t. prior positions:\n"
               << "  - rmse:   " << std::sqrt(Mean(verr2_wrt_prior)) << '\n'
@@ -1076,6 +1184,11 @@ class PosePriorBundleAdjuster : public CeresBundleAdjuster {
 
   std::unique_ptr<DefaultBundleAdjuster> default_bundle_adjuster_;
   std::unique_ptr<ceres::LossFunction> prior_loss_function_;
+
+  // Non-camera sensor data -> the frame that recorded it. Lets a prior on a
+  // rigidly mounted sensor (e.g. a GNSS antenna) find the rig pose its
+  // residual is evaluated through. See plan-6 item 3.
+  std::map<data_t, frame_t> sensor_data_to_frame_;
 
   Sim3d normalized_from_metric_;
 };

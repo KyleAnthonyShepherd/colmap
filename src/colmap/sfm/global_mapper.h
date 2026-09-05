@@ -7,6 +7,7 @@
 #include "colmap/scene/pose_graph.h"
 #include "colmap/scene/reconstruction.h"
 #include "colmap/sfm/incremental_triangulator.h"
+#include "colmap/sfm/prior_positions.h"
 
 #include <filesystem>
 #include <limits>
@@ -232,6 +233,41 @@ struct GlobalMapperOptions {
   // continue anyway.
   bool allow_lossy_prior_import = false;
 
+  // ── POSITION PRIORS ────────────────────────────────────────────────────
+  //
+  // The live path is the one that matters for a walk, and until now it could
+  // not use GNSS at all: `prior_reconstruction_path` is a prior *model*, and
+  // the `pose_priors` table was read only for pair selection. These options
+  // are named to match `pose_prior_mapper` exactly, so the two binaries stay
+  // interchangeable in scripts. See plan-6 item 1.
+
+  // Whether to constrain the solve with the database's position priors.
+  bool use_prior_position = false;
+
+  // Whether to down-weight prior-position residuals with a Cauchy loss.
+  bool use_robust_loss_on_prior_position = false;
+
+  // Threshold on the (covariance-whitened) residual for the robust loss.
+  // chi2 for 3 DOF at 95% = 7.815.
+  double prior_position_loss_scale = 7.815;
+
+  // Standard deviation, in metres, assumed for a prior that carries no
+  // covariance. The covariance is read from the database by default -- the
+  // site pipeline writes real per-frame values, and a 1 m default would throw
+  // away a 1.6 cm vertical measurement -- so this is a last resort, not a
+  // setting to reach for.
+  double prior_position_fallback_stddev = 1.0;
+
+  // Absolute-pose acceptance gate: a PnP registration is declined when its
+  // camera centre is further from its prior than BOTH this many sigmas and
+  // `prior_position_max_error_m` metres. Rejecting a blunder at registration
+  // is worth far more than optimising it afterwards, because a pose that is
+  // admitted has already displaced every frame registered after it. <= 0
+  // disables the gate. See IncrementalMapper::Options for the reasoning
+  // behind requiring both conditions.
+  double prior_position_max_error_sigma = 5.0;
+  double prior_position_max_error_m = 0.1;
+
   // ─────────────────────────────────────────────────────────────────────
 };
 
@@ -272,6 +308,17 @@ struct IncrementalAddLedger {
   double mean_reproj_error = 0.0;
   double mean_track_length = 0.0;
   bool intrinsics_refreshed = false;
+
+  // Position-prior agreement for this add (plan-6 item 2). All zero when
+  // priors are not in use. `worst_sigma` is the Mahalanobis distance of the
+  // largest disagreement -- the number that would have named `img_0059` on
+  // the add that broke it, instead of six rounds of re-deriving the geometry
+  // from `residuals.csv` afterwards.
+  size_t prior_residuals = 0;
+  double prior_residual_rms = 0.0;
+  double prior_residual_worst = 0.0;
+  double prior_residual_worst_sigma = 0.0;
+  image_t prior_residual_worst_image = kInvalidImageId;
 
   // Total prior points lost at import time. Zero unless the prior and the
   // database disagree.
@@ -475,6 +522,36 @@ class GlobalMapper {
   // and accumulates into `ledger` when non-null.
   size_t RefreshIntrinsicsGlobally(const GlobalMapperOptions& options,
                                    IncrementalAddLedger* ledger = nullptr);
+
+  // Reads the database's position priors and expresses them in the current
+  // reconstruction's world frame, caching the result for the rest of this
+  // solve. Must be called AFTER LoadPriorPoses(), so the fit has registered
+  // camera centres to work from, and BEFORE RegisterNewImagesByPnP() /
+  // SolveIncrementalWindowed(), which both consume it.
+  //
+  // Returns false when no usable priors could be placed; the solve then
+  // proceeds unconstrained, exactly as before. No-op returning false when
+  // options.use_prior_position is not set.
+  bool ComputeWorldPositionPriors(const GlobalMapperOptions& options);
+
+  // The priors computed above. Empty until ComputeWorldPositionPriors() has
+  // run successfully.
+  const WorldPositionPriors& PositionPriors() const {
+    return position_priors_;
+  }
+
+  // Images whose pose was free AND constrained by a position prior during
+  // this solve's bundle adjustment -- the `used_in_ba` column of the
+  // per-image residual report. See plan-6 item 2.
+  const std::unordered_set<image_t>& PriorConstrainedImageIds() const {
+    return prior_constrained_image_ids_;
+  }
+
+  // Whether this solve is constrained by position priors. When it is, the
+  // reconstruction is metric and must not be renormalized: Reconstruction::
+  // Normalize() rescales the model, which is exactly the metric scale the
+  // priors just established.
+  bool UsePositionPriors() const { return !position_priors_.Empty(); }
   // ──────────────────────────────────────────────────────────────────────
 
   // Getter functions.
@@ -501,6 +578,14 @@ class GlobalMapper {
   // Subsampled prior 3D points (world coordinates) used for a cheap
   // cheirality sanity check on bootstrapped poses.
   std::vector<Eigen::Vector3d> prior_points_sample_;
+
+  // Database position priors expressed in this reconstruction's world frame.
+  // Populated by ComputeWorldPositionPriors(); consumed by PnP registration
+  // and by the windowed solve's local bundle adjustment.
+  WorldPositionPriors position_priors_;
+
+  // See PriorConstrainedImageIds().
+  std::unordered_set<image_t> prior_constrained_image_ids_;
   // ──────────────────────────────────────────────────────────────────────
 };
 

@@ -298,7 +298,11 @@ available as ``colmap [command]``:
   improve match verification results.
 
 - ``mapper``: Sparse 3D reconstruction / mapping of the dataset using SfM after
-  performing feature extraction and matching.
+  performing feature extraction and matching. Position priors from the
+  ``pose_priors`` table are *not* used by default; enable them with
+  ``--Mapper.use_prior_position``, or use ``pose_prior_mapper``, which turns
+  that on for you and adds the covariance-overwrite options. For adding images
+  to an already-solved model with priors, see ``incremental_global_mapper``.
 
 - ``global_mapper``: Sparse 3D reconstruction using the global SfM pipeline.
   Unlike the incremental ``mapper``, the global approach solves for all camera
@@ -310,6 +314,18 @@ available as ``colmap [command]``:
   camera calibrations manually.
 
 - ``pose_prior_mapper``: Sparse 3D reconstruction / mapping using pose priors.
+  This is ``mapper`` with ``use_prior_position`` forced on. Note the naming:
+  its prior options are **un-prefixed** (``--use_robust_loss_on_prior_position``,
+  ``--prior_position_loss_scale``, ``--overwrite_priors_covariance``,
+  ``--prior_position_std_{x,y,z}``) while its reconstruction options carry the
+  ``Mapper.`` prefix (``--Mapper.ba_refine_focal_length``). The first three of
+  those are also reachable as ``--Mapper.use_prior_position``,
+  ``--Mapper.use_robust_loss_on_prior_position`` and
+  ``--Mapper.prior_position_loss_scale``; both spellings set the same values.
+  The covariance options exist only here and in
+  ``incremental_global_mapper``, because they write to the database. Priors
+  must be ``WGS84`` or ``CARTESIAN``; a prior left ``UNDEFINED`` has no metric
+  meaning and is ignored.
 
 - ``hierarchical_mapper``: Sparse 3D reconstruction / mapping of the dataset
   using hierarchical SfM after performing feature extraction and matching.

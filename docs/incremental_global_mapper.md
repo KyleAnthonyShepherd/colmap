@@ -24,7 +24,16 @@ colmap incremental_global_mapper \
     [--bootstrap_min_inliers 10] \
     [--bootstrap_max_candidate_deg 10.0] \
     [--bootstrap_max_gravity_error_deg 15.0] \
-    [--realign_to_prior 1]
+    [--realign_to_prior 1] \
+    [--use_prior_position 1] \
+    [--use_robust_loss_on_prior_position 1] \
+    [--prior_position_loss_scale 7.815] \
+    [--prior_position_fallback_stddev 1.0] \
+    [--prior_position_max_error_sigma 5.0] \
+    [--prior_position_max_error_m 0.1] \
+    [--overwrite_priors_covariance 0] \
+    [--prior_position_std_x 1.0 --prior_position_std_y 1.0 \
+     --prior_position_std_z 1.0]
 ```
 
 The database must already contain features and verified matches for the new
@@ -75,6 +84,131 @@ global reconstruction.
      establishment from scratch, global positioning, iterative bundle
      adjustment, and retriangulation over all frames, with rotation
      averaging skipped in favour of the bootstrapped rotations.
+
+## Position priors (`--use_prior_position`)
+
+Off by default. When on, the database's `pose_priors` table stops being read
+only for pair selection and becomes a constraint on the solve.
+
+Why it matters: a priorless model has no scale of its own, so a wrong Sim3 and
+a wrong model are indistinguishable. Measured on `sessions/test1-2` (69 images,
+identical database), the priorless `mapper` produced a Sim3 scale of 1.7037
+against `pose_prior_mapper`'s 1.0053, a camera-height IQR of 0.075 m against
+0.036 m, and a worst GNSS/SfM step ratio of 4.17 against 1.47. With priors the
+model is metric *before* georeferencing runs, and the Sim3 becomes a check
+rather than a correction.
+
+Three things happen when the flag is set:
+
+1. **The priors are moved into the reconstruction's frame**, not the other way
+   round (`sfm/prior_positions.h`). A Sim3 is fitted robustly from the
+   registered cameras' solved centres to their priors and inverted; the priors
+   and their covariances are transformed by it. Transforming the *model*, as
+   the cold `pose_prior_mapper` path does, would move every previously solved
+   camera out of the prior reconstruction's gauge — which an incremental add
+   must never do. If the fit is impossible (fewer than 3 registered images
+   carry a prior) or fails, the add runs unconstrained and says so.
+
+2. **Registration is gated.** After PnP + refinement and *before* anything is
+   committed, a candidate pose whose camera centre disagrees with its prior by
+   more than both `--prior_position_max_error_sigma` sigmas (Mahalanobis,
+   under the prior's own covariance) and `--prior_position_max_error_m` metres
+   is declined. Both conditions together: a 1.6 cm vertical sigma would
+   otherwise reject on ordinary SfM noise, and a metric-only test has no idea
+   how good the fix is. A declined image is retried on the next add, which is
+   strictly better than a confident wrong pose — at `img_0059` the priorless
+   solve moved the camera 1.238 m where the operator had moved 0.297 m (~8σ),
+   and every later frame inherited the displacement.
+
+3. **Bundle adjustment gets a position residual.** On the windowed path the
+   residual is added to the images the covisibility window leaves free, with
+   alignment and normalization disabled so the gauge stays exactly where the
+   constant poses put it. On the full path the existing pose-prior bundle
+   adjuster runs (the same one `pose_prior_mapper` uses), which aligns the
+   model to the priors and leaves it metric; `Reconstruction::Normalize()` is
+   skipped throughout, since it would rescale away the metric scale the priors
+   just established. For the same reason, realignment to `anchors.txt` is
+   skipped when priors are active: the priors are the gauge.
+
+Covariance is **read from the database** by default. The site pipeline writes
+real per-frame covariance, and the 1 m default would throw away a 1.6 cm
+vertical measurement — so `--prior_position_fallback_stddev` is a last resort,
+and `--overwrite_priors_covariance` (which rewrites the covariance of every
+prior in the database) is for datasets that have none.
+
+Only `CARTESIAN` (`coordinate_system = 1`) priors are used. `WGS84` priors are
+converted to Cartesian ENU on load when the flag is set; anything still
+`UNDEFINED` after that has no metric meaning and is dropped with a warning
+rather than mixed in.
+
+## Prior residual report (`prior_residuals.tsv`)
+
+Written beside the model on every add that uses position priors, one row per
+registered image with a prior:
+
+```
+image_id  name  prior_x/y/z  solved_x/y/z  residual_x/y/z  residual_norm
+sigma_x/y/z  mahalanobis  robust_weight  used_in_ba
+```
+
+`sigma_*` is what the cost function was actually weighted by (the covariance
+diagonal in world frame, after the frame fit). `robust_weight` is the weight
+the Cauchy loss gave the residual, 1 when the loss is trivial. `used_in_ba` is
+1 when this image's pose was free *and* constrained by its prior in this add's
+bundle adjustment — the prior pulled on it, rather than merely existing.
+
+The point is that a stuck or displaced frame is identifiable from this file
+alone. Everything in it is already known to bundle adjustment; before, finding
+`img_0059` meant reading `residuals.csv`, re-deriving `R_enu_from_cam` per
+frame from the model and the Sim3, rotating residuals into each camera's own
+frame, and comparing consecutive steps.
+
+The ledger (`incremental_ledger.tsv`) carries the same signal per add in five
+new columns — `prior_residuals`, `prior_rms`, `prior_worst`,
+`prior_worst_sigma`, `prior_worst_image` — so it is visible *during* the walk.
+A ledger written by an older build is migrated on carry-forward: the header is
+widened and old rows are padded with empty fields (empty, not zero, because
+the measurement did not exist).
+
+## The antenna as a rig sensor
+
+A GNSS antenna is not at the camera centre. Turning an antenna position into a
+camera-centre prior needs the camera's full orientation including yaw, which
+with no magnetometer only exists after the model is solved — hence the
+three-fidelity prior ladder, the two-pass georeferencing and the stripe
+correlation diagnostic the site repo carries.
+
+The antenna is, however, exactly a second sensor rigidly mounted to the
+camera, and this build has rigs. A pose prior whose `corr_sensor_type` names a
+non-camera sensor (`SensorType::GNSS = 2`) that belongs to the frame's rig now
+gets its residual attached through that sensor:
+
+```
+residual = P_antenna_measured - (C_cam + R_world_from_cam * l_sensor)
+```
+
+evaluated by `AbsoluteRigPosePositionPriorCostFunctor` over
+(`sensor_from_rig`, `rig_from_world`). Under
+`--Mapper.ba_refine_sensor_from_rig` the `sensor_from_rig` translation is a
+free parameter, so **bundle adjustment estimates the lever arm** instead of
+requiring it to be measured — and keeps estimating it, for free, as the mount
+changes. Robust alignment (`AlignReconstructionToPosePriors`) resolves such
+priors through the frame as well, so a cold solve can use antenna positions
+directly.
+
+To use it, the caller declares the antenna in the database: a rig sensor of
+type `GNSS` with a `sensor_from_rig` transform (the measured lever arm, e.g.
+`l = [0, 0.1524, 0]`, as the starting value), and pose priors whose
+`corr_sensor_type` is that type. A sensor with no `sensor_from_rig` is
+rejected with a warning: bundle adjustment can refine a lever arm, not invent
+one.
+
+Verify against the recovered `sensor_from_rig` translation, which is a direct
+measurement — *not* against the stripe correlation. On `test1-2` the stripe did
+not collapse under `pose_prior_mapper` (0.674 → 0.744) and a distributed ~7 cm
+camera-frame systematic survives on both solvers, with the lever arm already
+eliminated as its cause on physical grounds. A rig term may fit the arm
+correctly and still leave that 7 cm behind.
 
 ## Gauge anchors (`anchors.txt`)
 
@@ -149,6 +283,19 @@ Re-run on target hardware at N = 50/150/300 for real curves.
 - Gravity priors written to `pose_priors` (camera-frame "direction gravity
   pulls", COLMAP 4.x schema) are consumed by the gravity gate
   automatically; no new flags needed.
+- To use GNSS on the live path, add `--use_prior_position 1` to the
+  `incremental_global_mapper` invocation. The server already writes
+  `pose_priors` rows with real per-frame covariance and
+  `coordinate_system = 1` (CARTESIAN ENU metres), which is exactly what this
+  consumes — no schema change, and **do not** pass
+  `--overwrite_priors_covariance`, which would replace those measurements
+  with a constant. Consider `--use_robust_loss_on_prior_position 1` so one
+  bad fix cannot drag the window.
+- With priors on, the model is metric and `anchors.txt` realignment is
+  skipped; the georeferencing Sim3 becomes a check (expect scale within 1% of
+  1.0) rather than a correction.
+- `prior_residuals.tsv` rides along with the model directory promotion, like
+  `anchors.txt`, and the ledger gains five `prior_*` columns.
 - To enable the windowed path in production, add
   `--optimize_window_size 20 --full_solve_interval 10` to the
   `incremental_global_mapper` invocation in `colmap_runner.py`. No other

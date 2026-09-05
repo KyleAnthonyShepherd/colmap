@@ -248,7 +248,23 @@ struct PosePriorBundleAdjustmentOptions
   // Fallback if no prior position covariance is provided.
   double prior_position_fallback_stddev = 1.0;
 
-  // Sim3 alignment options.
+  // Whether to robustly align (and then normalize) the reconstruction to the
+  // pose priors before adding the prior residuals.
+  //
+  // True is the cold-solve behaviour: a from-scratch model has an arbitrary
+  // gauge, so it must be moved into the priors' frame before a position
+  // residual means anything.
+  //
+  // Set false when the reconstruction is *already* expressed in the priors'
+  // frame and must stay where it is -- an incremental/windowed add, whose
+  // gauge is fixed by its constant poses and whose output has to remain
+  // comparable with the prior model it extends. Aligning there would move
+  // every previously solved camera. With alignment off the caller owns the
+  // gauge: no normalization is applied and no gauge is fixed.
+  bool align_reconstruction_to_priors = true;
+
+  // Sim3 alignment options. Only used when
+  // `align_reconstruction_to_priors` is true.
   RANSACOptions alignment_ransac_options;
 
   bool Check() const;

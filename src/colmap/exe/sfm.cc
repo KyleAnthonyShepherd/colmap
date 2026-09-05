@@ -41,6 +41,7 @@
 #include "colmap/exe/gui.h"
 #include "colmap/scene/reconstruction.h"
 #include "colmap/sfm/observation_manager.h"
+#include "colmap/sfm/prior_positions.h"
 #include "colmap/util/file.h"
 #include "colmap/util/misc.h"
 #include "colmap/util/opengl_utils.h"
@@ -420,6 +421,14 @@ int RunIncrementalGlobalMapper(int argc, char** argv) {
   std::filesystem::path prior_reconstruction_path;
   std::filesystem::path output_path;
 
+  // Position-prior options. Named exactly as in `pose_prior_mapper` and, like
+  // there, un-prefixed -- the `Mapper.`-prefixed options belong to the
+  // reconstruction algorithm, these to the prior handling around it.
+  bool overwrite_priors_covariance = false;
+  double prior_position_std_x = 1.;
+  double prior_position_std_y = 1.;
+  double prior_position_std_z = 1.;
+
   OptionManager options;
   options.AddDatabaseOptions();
   options.AddImageOptions();
@@ -490,8 +499,62 @@ int RunIncrementalGlobalMapper(int argc, char** argv) {
       "imported faithfully. Off by default: a lossy import means the prior "
       "and the database disagree, and the loss compounds across adds.");
 
+  // ── Position priors ──────────────────────────────────────────────────
+  options.AddDefaultOption(
+      "use_prior_position",
+      &options.global_mapper->mapper.use_prior_position,
+      "Constrain the solve with the database's position priors (the "
+      "`pose_priors` table). Off by default. With priors on, the model is "
+      "metric before georeferencing runs and a pose that contradicts its "
+      "GNSS fix is declined at registration rather than optimised "
+      "afterwards.");
+  options.AddDefaultOption(
+      "use_robust_loss_on_prior_position",
+      &options.global_mapper->mapper.use_robust_loss_on_prior_position,
+      "Down-weight prior-position residuals with a Cauchy loss.");
+  options.AddDefaultOption(
+      "prior_position_loss_scale",
+      &options.global_mapper->mapper.prior_position_loss_scale,
+      "Threshold on the covariance-whitened residual for the robust loss "
+      "(chi2, 3 DOF, 95% = 7.815).");
+  options.AddDefaultOption(
+      "prior_position_fallback_stddev",
+      &options.global_mapper->mapper.prior_position_fallback_stddev,
+      "Standard deviation (m) assumed for a prior that carries no covariance "
+      "of its own. Covariance is read from the database by default; this is "
+      "a last resort, and a 1 m default would throw away a centimetre-level "
+      "measurement.");
+  options.AddDefaultOption(
+      "prior_position_max_error_sigma",
+      &options.global_mapper->mapper.prior_position_max_error_sigma,
+      "Decline an absolute-pose registration whose camera centre disagrees "
+      "with its prior by more than this many sigmas AND more than "
+      "--prior_position_max_error_m metres. <= 0 disables the gate.");
+  options.AddDefaultOption(
+      "prior_position_max_error_m",
+      &options.global_mapper->mapper.prior_position_max_error_m,
+      "Absolute floor (m) for the registration gate above, so a very tight "
+      "prior sigma cannot reject on ordinary SfM noise.");
+  options.AddDefaultOption(
+      "overwrite_priors_covariance",
+      &overwrite_priors_covariance,
+      "Priors covariance is read from the database. If true, overwrite it in "
+      "the database using the prior_position_std_... options below.");
+  options.AddDefaultOption("prior_position_std_x", &prior_position_std_x);
+  options.AddDefaultOption("prior_position_std_y", &prior_position_std_y);
+  options.AddDefaultOption("prior_position_std_z", &prior_position_std_z);
+
   if (!options.Parse(argc, argv)) {
     return EXIT_FAILURE;
+  }
+
+  if (overwrite_priors_covariance) {
+    const Eigen::Matrix3d covariance =
+        Eigen::Vector3d(
+            prior_position_std_x, prior_position_std_y, prior_position_std_z)
+            .cwiseAbs2()
+            .asDiagonal();
+    UpdateDatabasePosePriorsCovariance(*options.database_path, covariance);
   }
 
   if (!ExistsDir(output_path)) {
@@ -547,6 +610,15 @@ int RunIncrementalGlobalMapper(int argc, char** argv) {
   // tracking only survive on disk. The ledger carries the whole session's
   // structure accounting forward so decay across a drip-fed session is a
   // query over a file rather than a guess.
+  // Per-image position-prior residuals, beside the model: prior position,
+  // solved position, residual, the sigma actually used, and the weight the
+  // robust loss gave it. Written every add, so a displaced frame is visible
+  // during the walk rather than only at finalize. See plan-6 item 2.
+  if (!pipeline.PriorResiduals().empty()) {
+    WritePriorPositionResiduals(model_dir / "prior_residuals.tsv",
+                                pipeline.PriorResiduals());
+  }
+
   WriteIncrementalState(model_dir / "incremental_state.txt", pipeline.State());
   AppendIncrementalLedger(
       model_dir / "incremental_ledger.tsv",
@@ -620,18 +692,43 @@ int RunPosePriorMapper(int argc, char** argv) {
 
   options.mapper->use_prior_position = true;
 
+  // NOTE: these prior options are deliberately un-prefixed, while this
+  // binary's reconstruction options carry the `Mapper.` prefix
+  // (--Mapper.ba_refine_focal_length and friends). The same three settings
+  // are also reachable as --Mapper.use_prior_position,
+  // --Mapper.use_robust_loss_on_prior_position and
+  // --Mapper.prior_position_loss_scale; both spellings set the same values.
+  // The covariance options below exist only here and in
+  // `incremental_global_mapper`, because they write to the database.
   options.AddDefaultOption(
       "overwrite_priors_covariance",
       &overwrite_priors_covariance,
-      "Priors covariance read from database. If true, overwrite the priors "
-      "covariance using the follwoing prior_position_std_... options");
-  options.AddDefaultOption("prior_position_std_x", &prior_position_std_x);
-  options.AddDefaultOption("prior_position_std_y", &prior_position_std_y);
-  options.AddDefaultOption("prior_position_std_z", &prior_position_std_z);
-  options.AddDefaultOption("use_robust_loss_on_prior_position",
-                           &options.mapper->use_robust_loss_on_prior_position);
-  options.AddDefaultOption("prior_position_loss_scale",
-                           &options.mapper->prior_position_loss_scale);
+      "Priors covariance is read from the database. If true, overwrite it "
+      "using the prior_position_std_... options below. Un-prefixed, unlike "
+      "the Mapper.* reconstruction options.");
+  options.AddDefaultOption("prior_position_std_x",
+                           &prior_position_std_x,
+                           "Prior position std dev (m) on x, used only with "
+                           "--overwrite_priors_covariance.");
+  options.AddDefaultOption("prior_position_std_y",
+                           &prior_position_std_y,
+                           "Prior position std dev (m) on y, used only with "
+                           "--overwrite_priors_covariance.");
+  options.AddDefaultOption("prior_position_std_z",
+                           &prior_position_std_z,
+                           "Prior position std dev (m) on z, used only with "
+                           "--overwrite_priors_covariance.");
+  options.AddDefaultOption(
+      "use_robust_loss_on_prior_position",
+      &options.mapper->use_robust_loss_on_prior_position,
+      "Down-weight prior-position residuals with a Cauchy loss. Un-prefixed; "
+      "same as --Mapper.use_robust_loss_on_prior_position.");
+  options.AddDefaultOption(
+      "prior_position_loss_scale",
+      &options.mapper->prior_position_loss_scale,
+      "Threshold on the covariance-whitened residual for the robust loss "
+      "(chi2, 3 DOF, 95% = 7.815). Un-prefixed; same as "
+      "--Mapper.prior_position_loss_scale.");
   if (!options.Parse(argc, argv)) {
     return EXIT_FAILURE;
   }

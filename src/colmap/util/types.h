@@ -132,15 +132,20 @@ enum class SensorType {
   INVALID = -1,
   CAMERA = 0,
   IMU = 1,
+  GNSS = 2,
 };
 #else
-MAKE_ENUM_CLASS_OVERLOAD_STREAM(SensorType, -1, INVALID, CAMERA, IMU);
+// GNSS is a position-only sensor: it carries no measurements of its own in a
+// reconstruction, only pose priors. Modelling the antenna as a rig sensor is
+// what lets bundle adjustment estimate the camera-to-antenna lever arm
+// instead of requiring the caller to know it in advance. See plan-6 item 3.
+MAKE_ENUM_CLASS_OVERLOAD_STREAM(SensorType, -1, INVALID, CAMERA, IMU, GNSS);
 #endif
 
 struct sensor_t {
   constexpr static uint32_t kInvalidId = std::numeric_limits<uint32_t>::max();
 
-  // Type of the sensor (INVALID / CAMERA / IMU)
+  // Type of the sensor (INVALID / CAMERA / IMU / GNSS)
   SensorType type;
   // Unique identifier of the sensor.
   // This can be camera_t / imu_t (not supported yet)

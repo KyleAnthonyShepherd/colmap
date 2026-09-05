@@ -132,8 +132,10 @@ bool Reconstruction::IsValid() const {
           }
           break;
         case SensorType::IMU:
+        case SensorType::GNSS:
         case SensorType::INVALID:
-          // Only camera sensors are currently supported.
+          // Only camera sensors carry data of their own. A GNSS sensor exists
+          // in the rig purely to hang position priors (and its lever arm) on.
           break;
       }
     }
@@ -174,6 +176,7 @@ bool Reconstruction::IsValid() const {
           }
           break;
         case SensorType::IMU:
+        case SensorType::GNSS:
         case SensorType::INVALID:
           // Only camera data is currently supported.
           break;
@@ -375,6 +378,7 @@ void Reconstruction::TearDown() {
             cameras_.erase(sensor_id.id);
             break;
           case SensorType::IMU:
+          case SensorType::GNSS:
           case SensorType::INVALID:
             break;
         }
@@ -401,6 +405,7 @@ void Reconstruction::AddRig(class Rig rig) {
                "should be called before AddRig.";
         break;
       case SensorType::IMU:
+      case SensorType::GNSS:
       case SensorType::INVALID:
         break;
     }
@@ -443,6 +448,10 @@ void Reconstruction::AddFrame(class Frame frame) {
         break;
       case SensorType::IMU:
         // Note that we do not (yet) support IMU measurement data.
+        break;
+      case SensorType::GNSS:
+        // A GNSS sensor carries no measurement data; see plan-6 item 3.
+        THROW_CHECK(rig.HasSensor(data_id.sensor_id));
         break;
       case SensorType::INVALID:
         LOG(FATAL_THROW) << "Invalid sensor type: " << data_id.sensor_id.type;
